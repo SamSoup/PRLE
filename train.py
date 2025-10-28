@@ -205,19 +205,19 @@ def train(config):
     )
 
     checkpoint_callback = ModelCheckpoint(
-        monitor="val_loss",
-        mode="min",
+        monitor=getattr(config.model, "monitor", "val_mse"),
+        mode=getattr(config.model, "mode", "min"),
         save_top_k=1,
         save_last=True,
         filename="best-model",
     )
 
     early_stop_callback = EarlyStopping(
-        monitor="val_loss",
+        monitor=getattr(config.model, "monitor", "val_mse"),
         min_delta=config.train.get("min_delta", 0.0),
         patience=config.train.get("early_stop_patience", 5),
         verbose=True,
-        mode="min",
+        mode=getattr(config.model, "mode", "min"),
     )
 
     trainer = pl.Trainer(

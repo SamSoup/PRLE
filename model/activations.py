@@ -156,18 +156,76 @@ class RadiusRouter(ActivationRouter):
 
 class SoftmaxRouter(ActivationRouter):
     """
-    Dense differentiable gating: α = softmax(-τ * dist).
-    τ is learned and controls sharpness.
+    Dense differentiable gating with temperature annealing.
+
+    We compute:
+        τ_eff = clamp( tau_raw * tau_multiplier, tau_min, tau_max )
+        weights = softmax( -τ_eff * dist )
+
+    Where:
+      - tau_raw is a learned Parameter (if training enabled).
+      - tau_multiplier is a running buffer we anneal each epoch
+        (e.g. multiply by 0.95 every epoch to gradually sharpen).
+      - clamp(·) prevents pathological extremes.
+
+    Why:
+      * Early epochs: smoother routing → stable gradients.
+      * Later epochs: sharper routing → more local experts, better ranking.
     """
 
-    def __init__(self, distance_metric: str):
+    def __init__(
+        self,
+        distance_metric: str,
+        tau_init: float = 1.0,
+        tau_min: float = 0.1,
+        tau_max: float = 10.0,
+        anneal_gamma: float = 0.95,
+    ):
         super().__init__(distance_metric=distance_metric)
-        # tau is trainable by default (this is our gating param)
-        self.tau = nn.Parameter(torch.tensor(1.0), requires_grad=True)
+
+        # base learnable temperature (1 scalar)
+        self.tau_raw = nn.Parameter(
+            torch.tensor(float(tau_init)), requires_grad=True
+        )
+
+        # multiplier that we decay each epoch (not trainable by grad)
+        self.register_buffer(
+            "tau_multiplier",
+            torch.tensor(1.0, dtype=torch.float32),
+            persistent=True,
+        )
+
+        # hyperparams for stability
+        self.tau_min = float(tau_min)
+        self.tau_max = float(tau_max)
+        self.anneal_gamma = float(anneal_gamma)
 
     def enable_training(self, flag: bool) -> None:
-        self.tau.requires_grad = flag
+        # Toggle gradient updates for tau_raw
+        self.tau_raw.requires_grad = flag
         self.train(flag)
+
+    @torch.no_grad()
+    def epoch_anneal(self) -> None:
+        """
+        Called once per training epoch by LightningModule.
+        We decay tau_multiplier so τ_eff gets smaller over time,
+        which sharpens routing (more peaky softmax).
+        """
+        # multiply and clamp to avoid collapsing to 0 too fast
+        new_mult = self.tau_multiplier * self.anneal_gamma
+        # don't let it go negative or crazy tiny
+        new_mult = torch.clamp(new_mult, min=0.05, max=100.0)
+        self.tau_multiplier.copy_(new_mult)
+
+    def _effective_tau(self) -> torch.Tensor:
+        """
+        Compute τ_eff = clamp(tau_raw * tau_multiplier, [tau_min, tau_max])
+        Return shape (), on correct device.
+        """
+        tau_eff = self.tau_raw * self.tau_multiplier
+        tau_eff = torch.clamp(tau_eff, self.tau_min, self.tau_max)
+        return tau_eff
 
     def forward(
         self,
@@ -177,7 +235,8 @@ class SoftmaxRouter(ActivationRouter):
         value_protos: torch.Tensor,
     ) -> torch.Tensor:
         dists = self._distances(retrieval_embeds, retrieval_protos)  # (B,P)
-        return torch.softmax(-self.tau * dists, dim=1)  # (B,P)
+        tau_eff = self._effective_tau()  # scalar tensor
+        return torch.softmax(-tau_eff * dists, dim=1)  # (B,P)
 
 
 class SparseMLPRouter(ActivationRouter):

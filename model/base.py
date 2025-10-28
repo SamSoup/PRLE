@@ -17,15 +17,16 @@ class BasePrototypicalRegressor(pl.LightningModule):
     """
     PRLE base class.
 
-    High-level:
-      - PrototypeManager: owns prototypes + projection head + metric learning.
-      - ActivationRouter: owns routing/gating logic and any routing params.
-      - Subclass (e.g. LinearExpertPRLE): owns per-prototype experts.
+    Pieces:
+      - PrototypeManager: prototypes + projection head + metric learning.
+      - ActivationRouter: routing / gating logic.
+      - Subclass (LinearExpertPRLE, etc.): per-prototype experts.
 
-    This class:
-      - Orchestrates forward().
-      - Computes all loss terms (task, metric, proto_self, local, consistency).
-      - Handles EM-style alternation and phase-weighted loss.
+    Responsibilities:
+      - forward() composition
+      - multi-term loss (task, metric, proto_self, local, consistency)
+      - EM-style alternation control
+      - logging / metrics
     """
 
     def __init__(
@@ -76,6 +77,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self.distance_metric = distance.lower().strip()
         assert self.distance_metric in {"cosine", "euclidean"}
 
+        # datamodule with cached embeddings
         self.dm: Optional[pl.LightningDataModule] = datamodule
 
         # -------------------
@@ -185,7 +187,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         retrieval_embeds: torch.Tensor,  # (B,H_retrieval)
     ) -> Dict[str, torch.Tensor]:
         """
-        Produce predictions and all intermediates needed for loss.
+        Produce predictions + intermediates for losses.
+
         Returns:
             retrieval_protos: (P,H)
             value_protos:     (P,Dv)
@@ -196,24 +199,35 @@ class BasePrototypicalRegressor(pl.LightningModule):
         """
         self._ensure_prototypes_ready()
 
-        retrieval_protos = (
-            self.prototype_manager.get_retrieval_prototypes()
-        )  # (P,H)
-        value_protos = self.prototype_manager.get_value_prototypes()  # (P,Dv)
+        batch_device = retrieval_embeds.device
 
+        # Get prototypes on SAME DEVICE as the batch.
+        retrieval_protos = self.prototype_manager.get_retrieval_prototypes(
+            device=batch_device
+        )  # (P,H)
+
+        # Project embeddings to value space
         value_embeds = self.prototype_manager.project_embeddings(
             retrieval_embeds
         )  # (B,Dv)
 
+        # Project prototype embeddings to value space
+        value_protos = self.prototype_manager.get_value_prototypes(
+            device=batch_device
+        )  # (P,Dv)
+
+        # Router/gating: weights over prototypes
         weights = self.activation_router(
             retrieval_embeds=retrieval_embeds,
             retrieval_protos=retrieval_protos,
             value_embeds=value_embeds,
             value_protos=value_protos,
-        )  # (B,P), row-normalized
+        )  # (B,P)
 
+        # Experts: per-proto prediction for each example
         expert_matrix = self._expert_outputs(value_embeds)  # (B,P) or (B,P,1)
 
+        # Final scalar prediction
         preds = self._aggregate_expert_predictions(
             expert_matrix, weights
         )  # (B,)
@@ -271,25 +285,15 @@ class BasePrototypicalRegressor(pl.LightningModule):
 
     def _proto_self_loss(self) -> torch.Tensor:
         """
-        Prototype self-fit: each prototype's expert should match
-        its own anchor example's label.
-
-        Steps:
-        - Grab indices of the training examples each prototype claims to
-          represent (prototype_indices). That buffer lives on the model/device.
-        - Use those indices to pull the corresponding train embeddings + labels
-          from the datamodule caches (which live on CPU).
-        - Project those embeddings into value space.
-        - Run all experts on those projected embeddings.
-        - Compare expert p's prediction on prototype p to that prototype's
-          anchor label.
+        Prototype self-fit:
+          each prototype's expert should predict its own anchor's label.
         """
         if self.dm is None:
             return torch.tensor(0.0, device=self.device)
 
         pm = self.prototype_manager
 
-        # need stored prototype_indices from PrototypeManager
+        # Need stored prototype_indices
         if (
             not hasattr(pm, "prototype_indices")
             or pm.prototype_indices is None
@@ -297,12 +301,9 @@ class BasePrototypicalRegressor(pl.LightningModule):
         ):
             return torch.tensor(0.0, device=self.device)
 
-        # indices may be on CUDA (because they're a registered buffer),
-        # but dm.train_embeddings is CPU. Indexing across devices breaks,
-        # so force indices to CPU for the gather.
-        anchor_idx_cpu = pm.prototype_indices.detach().long().cpu()  # (P,)
+        # train_embeddings is on CPU → indices must be CPU
+        anchor_idx_cpu = pm.prototype_indices.detach().cpu().long()  # (P,)
 
-        # must have cached train embeddings / labels on the dm
         if (
             not hasattr(self.dm, "train_embeddings")
             or self.dm.train_embeddings is None
@@ -311,7 +312,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         ):
             return torch.tensor(0.0, device=self.device)
 
-        # pull anchors from CPU store using CPU indices, then move to model device
+        # Gather anchors on CPU then move to model device
         retr_anchor = (
             self.dm.train_embeddings[anchor_idx_cpu].to(self.device).float()
         )  # (P,H)
@@ -407,7 +408,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self,
         retrieval_embeds: torch.Tensor,  # (B,H)
         labels: torch.Tensor,  # (B,)
-        internals: Dict[str, torch.Tensor],  # fwd intermediates
+        internals: Dict[str, torch.Tensor],  # forward intermediates
     ) -> Dict[str, torch.Tensor]:
         c = self._phase_coeffs()
 
@@ -467,19 +468,19 @@ class BasePrototypicalRegressor(pl.LightningModule):
         """
         Make sure prototypes are initialized exactly once.
 
-        IMPORTANT: after loading from a checkpoint we may *already*
-        have prototype params/buffers. In that case we do NOT want
-        to regenerate / overwrite them.
+        We now rely on PrototypeManager._is_initialized_buf, which is saved
+        in checkpoints and starts at 0. After we populate real prototypes
+        from training embeddings, we flip it to 1.
         """
         pm = self.prototype_manager
 
-        # If prototypes already exist (param or buffer), do nothing.
-        if getattr(pm, "_retrieval_prototypes_param", None) is not None:
-            return
-        if hasattr(pm, "_retrieval_prototypes_buf"):
-            return
+        # If already initialized (fresh run or restored from checkpoint), stop.
+        if getattr(pm, "_is_initialized_buf", None) is not None:
+            if int(pm._is_initialized_buf.item()) == 1:
+                return
 
-        # Otherwise we are in a fresh run and need to init from train data.
+        # Otherwise we are in a fresh run (no checkpoint init yet)
+        # and we need to initialize from train data.
         if (
             self.dm is None
             or getattr(self.dm, "train_embeddings", None) is None
@@ -487,6 +488,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
             raise RuntimeError(
                 "EmbeddingDataModule not attached or not setup; cannot init prototypes."
             )
+
         train_cpu = self.dm.train_embeddings.detach().cpu()
         pm.initialize_from_train_embeddings(train_cpu)
 
@@ -510,7 +512,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
             self.log(
                 "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True
             )
-        else:
+        else:  # "test"
             preds = internals["preds"].detach().cpu()
             self._test_preds.append(preds)
             self._test_labels.append(labels.detach().cpu())
@@ -549,16 +551,17 @@ class BasePrototypicalRegressor(pl.LightningModule):
 
     def on_train_epoch_start(self):
         """
-        Flip phases if em_alt_training=True.
+        If em_alt_training=True, flip between:
+          - geometry phase: train projection/prototypes, freeze experts+router
+          - experts phase:  freeze geometry, train experts+router
 
-        geometry phase:
-            - train PrototypeManager (projection head + prototypes)
-            - freeze experts and activation_router
-
-        experts phase:
-            - freeze PrototypeManager geometry
-            - train experts and activation_router
+        If em_alt_training=False:
+          everything is trainable ("all_unfrozen").
         """
+        # NEW: gently anneal router temperature each epoch if it supports it
+        if hasattr(self.activation_router, "epoch_anneal"):
+            self.activation_router.epoch_anneal()
+
         if not self.em_alt_training:
             self._training_stage = "all_unfrozen"
             # everybody ON
@@ -568,7 +571,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
             self._enable_router_training(True)
             return
 
-        # alternate
+        # alternate stage each epoch
         if self._training_stage == "geometry":
             self._training_stage = "experts"
         else:
@@ -591,7 +594,9 @@ class BasePrototypicalRegressor(pl.LightningModule):
             self._enable_router_training(True)
 
     def on_train_epoch_end(self):
-        # snap prototypes back to nearest real training example for interpretability
+        """
+        Optional snapping (keeps prototypes tied to real examples).
+        """
         if (
             self.dm is not None
             and hasattr(self.dm, "train_embeddings")
@@ -606,6 +611,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
     # ------------------------------------------------------------
 
     def setup(self, stage: Optional[str] = None):
+        # Proactively ensure prototypes exist so logs/param-counts
+        # are stable before training begins.
         if stage in (None, "fit", "validate", "test", "predict"):
             self._ensure_prototypes_ready()
 
@@ -618,7 +625,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
 
     def _dump_trainable_status(self):
         """
-        Print who's trainable right now. Mostly for sanity.
+        Print who's trainable right now. Just for sanity / debug prints.
         """
 
         def count_params(mod: nn.Module) -> Tuple[int, int]:
