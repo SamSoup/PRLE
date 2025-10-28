@@ -1,278 +1,501 @@
-# /model/base.py
-# Prototypical regression w/ optional exemplar prototypes.
-# - One-time exemplar selection at trainer startup (setup(stage))
-# - Cache ONLY selected training examples (raw or tokenized)
-# - Step-wise refresh of exemplar embeddings if encoder trains end-to-end
-# - Persist + restore prototypes & examples in Lightning checkpoints
-# - No silhouette/auto-K, no periodic reselection, no val-MSE gating
+# model/base.py
 
-from typing import Optional, List, Dict, Tuple, Any, Union
+from typing import Optional, Dict, Any, Tuple, List
 import os
-import copy
-import numpy as np
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics.functional as tmf
 
-from torch.utils.data import DataLoader
-from sklearn.cluster import KMeans, DBSCAN, HDBSCAN  # assume availability
-from sklearn_extra.cluster import KMedoids
-from tqdm import tqdm  # assume installed
+from model.prototypes import PrototypeManager, build_prototype_manager
+from model.activations import build_activation_router
 
 
-# ------------------ small helpers ------------------
-def _normalize(x: torch.Tensor) -> torch.Tensor:
-    return F.normalize(x, p=2, dim=-1)
-
-
-def _cdist(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    return torch.cdist(a, b, p=2)
-
-
-def _farthest_first(X: torch.Tensor, k: int) -> torch.LongTensor:
-    """k-center greedy on cosine distance. X on CPU, shape (N,H), normalized inside."""
-    N = X.size(0)
-    if k >= N:
-        return torch.arange(N, dtype=torch.long)
-    Xn = _normalize(X)
-    idx0 = torch.randint(0, N, (1,)).item()
-    chosen = [idx0]
-    dmin = 1 - (Xn @ Xn[idx0])  # cosine distance
-    for _ in range(1, k):
-        j = torch.argmax(dmin).item()
-        chosen.append(j)
-        dmin = torch.minimum(dmin, 1 - (Xn @ Xn[j]))
-    return torch.tensor(chosen, dtype=torch.long)
-
-
-def _nearest_point_indices(
-    embeds: torch.Tensor, centers: np.ndarray, k: int
-) -> torch.LongTensor:
-    """Map each center to the nearest training example index (greedy, no dup)."""
-    E = embeds  # (N,H) CPU torch
-    C = torch.from_numpy(centers).to(E.dtype)
-    D = torch.cdist(E, C, p=2)  # (N,k)
-    used = set()
-    out = []
-    for j in range(C.size(0)):
-        col = D[:, j]
-        _, order = torch.sort(col)
-        pick = None
-        for idx in order:
-            ii = int(idx.item())
-            if ii not in used:
-                pick = ii
-                used.add(ii)
-                break
-        out.append(pick if pick is not None else int(order[0].item()))
-    return torch.tensor(out, dtype=torch.long)
-
-
-def _cluster_means_to_indices(
-    embeds: torch.Tensor, labels: np.ndarray
-) -> torch.LongTensor:
-    """For label array (>=1 non-noise cluster), compute per-cluster mean and map to nearest exemplar index."""
-    E = embeds.numpy()
-    ids = []
-    for lab in sorted(set(labels)):
-        if lab == -1:  # ignore noise (DBSCAN/HDBSCAN)
-            continue
-        mask = labels == lab
-        if mask.sum() <= 0:
-            continue
-        mean = E[mask].mean(axis=0, keepdims=True)  # (1,H)
-        idx = _nearest_point_indices(embeds, mean, 1).item()
-        ids.append(idx)
-    if len(ids) == 0:
-        # fallback: pick a single medoid-like point (global mean)
-        ids = [
-            _nearest_point_indices(
-                embeds, E.mean(axis=0, keepdims=True), 1
-            ).item()
-        ]
-    return torch.tensor(ids, dtype=torch.long)
-
-
-# ------------------ free prototype bank ------------------
-class PrototypeBank(nn.Module):
-    def __init__(self, num_prototypes: int, hidden_dim: int):
-        super().__init__()
-        self.weight = nn.Parameter(torch.randn(num_prototypes, hidden_dim))
-
-    def forward(self):
-        return self.weight
-
-
-# ------------------ main module ------------------
 class BasePrototypicalRegressor(pl.LightningModule):
+    """
+    PRLE base class.
+
+    High-level:
+      - PrototypeManager: owns prototypes + projection head + metric learning.
+      - ActivationRouter: owns routing/gating logic and any routing params.
+      - Subclass (e.g. LinearExpertPRLE): owns per-prototype experts.
+
+    This class:
+      - Orchestrates forward().
+      - Computes all loss terms (task, metric, proto_self, local, consistency).
+      - Handles EM-style alternation and phase-weighted loss.
+    """
+
     def __init__(
         self,
-        encoder: nn.Module,
-        hidden_dim: int,
+        hidden_dim: int,  # retrieval_dim
         num_prototypes: int,
-        mse_weight: float = 1.0,
-        cohesion_weight: float = 0.0,
-        separation_weight: float = 0.0,
         lr: float = 1e-4,
         output_dir: str = "outputs",
-        freeze_encoder: bool = False,
-        # Exemplar options
-        datamodule=None,  # pass the DM instance
-        prototype_mode: str = "free",  # "free" | "example"
-        prototype_selector: Optional[
-            str
-        ] = None,  # "kmedoids" | "kmeans++" | "farthest" | "dbscan" | "hdbscan" | None
+        datamodule: Optional[pl.LightningDataModule] = None,
+        # prototype / geometry config
+        distance: str = "cosine",
         seed: int = 42,
-        # Routing options
-        distance: str = "cosine",  # "cosine" | "euclidean"
-        tau_init: float = 1.0,  # learnable temperature for routing
+        init_strategy: str = "random_real",
+        map_strategy: str = "none",
+        trainable_prototypes: bool = False,
+        # value space / metric learning config
+        use_value_space: bool = True,
+        proj_dim: Optional[int] = None,
+        em_alt_training: bool = False,  # alternate per epoch between geometry vs experts
+        # activation / gating config
+        gating_strategy: str = "softmax",  # "knn" | "radius" | "softmax" | "mlp_sparse"
+        knn_k: int = 3,
+        radius_threshold: float = 0.5,
+        mlp_hidden_dim: int = 64,
+        # loss weighting per phase
+        lambda_task_geom: float = 1.0,
+        lambda_task_expert: float = 1.0,
+        lambda_metric_geom: float = 1.0,
+        lambda_metric_expert: float = 0.0,
+        lambda_proto_self_geom: float = 0.0,
+        lambda_proto_self_expert: float = 1.0,
+        lambda_local_geom: float = 0.0,
+        lambda_local_expert: float = 1.0,
+        lambda_consistency_geom: float = 1.0,
+        lambda_consistency_expert: float = 1.0,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["encoder", "datamodule"])
+        self.save_hyperparameters(ignore=["datamodule"])
 
-        # encoder
-        self.encoder = encoder
-        if isinstance(self.encoder, nn.Module):
-            for p in self.encoder.parameters():
-                p.requires_grad = not freeze_encoder
-            self.encoder.train(not freeze_encoder)
-
-        # core hparams
+        # -------------------
+        # core config
+        # -------------------
         self.hidden_dim = hidden_dim
         self.num_prototypes = int(num_prototypes)
         self.lr = lr
-        self.mse_weight = mse_weight
-        self.cohesion_weight = cohesion_weight
-        self.separation_weight = separation_weight
-        self.output_dir = output_dir
         self.seed = seed
 
-        # routing
-        distance = distance.lower().strip()
-        assert distance in {"cosine", "euclidean"}
-        self.distance = distance
-        self.tau = nn.Parameter(torch.tensor(float(tau_init)))
+        self.distance_metric = distance.lower().strip()
+        assert self.distance_metric in {"cosine", "euclidean"}
 
-        # datamodule
-        self.dm = datamodule  # may be None; we'll also check self.trainer.datamodule in setup()
+        self.dm: Optional[pl.LightningDataModule] = datamodule
 
-        # prototype mode
-        self.prototype_mode = prototype_mode.lower()
-        assert self.prototype_mode in {"free", "example"}
-
-        self.prototype_selector = (
-            None if prototype_selector is None else prototype_selector.lower()
+        # -------------------
+        # prototype manager (geometry)
+        # -------------------
+        self.prototype_manager: PrototypeManager = build_prototype_manager(
+            num_prototypes=self.num_prototypes,
+            retrieval_dim=self.hidden_dim,
+            proj_dim=proj_dim,
+            init_strategy=init_strategy,
+            map_strategy=map_strategy,
+            distance_metric=self.distance_metric,
+            trainable_prototypes=trainable_prototypes,
+            use_value_space=use_value_space,
+            seed=self.seed,
         )
-        if self.prototype_mode == "free":
-            self.prototype_selector = None
 
-        # containers
-        if self.prototype_mode == "free":
-            self._prototype_bank_real = PrototypeBank(
-                self.num_prototypes, hidden_dim
-            )
-            self.prototype_indices = None
-            self.prototype_examples = None
-            self.prototype_embeds = None
-        else:
-            self._prototype_bank_real = None
-            self.prototype_indices: Optional[torch.LongTensor] = None
-            # tokenized -> dict of tensors; raw-text -> {"text": list}
-            self.prototype_examples: Optional[Dict[str, Any]] = None
-            self.prototype_embeds: Optional[torch.Tensor] = None
+        # -------------------
+        # activation router (routing/selection of prototypes)
+        # -------------------
+        self.activation_router = build_activation_router(
+            strategy=gating_strategy,
+            distance_metric=self.distance_metric,
+            knn_k=knn_k,
+            radius_threshold=radius_threshold,
+            proj_dim=self.prototype_manager.proj_dim,
+            mlp_hidden_dim=mlp_hidden_dim,
+        )
 
-        # metric buffers
-        self._val_preds, self._val_labels = [], []
-        self._test_preds, self._test_labels = [], []
+        # -------------------
+        # experts (subclass builds self.experts etc.)
+        # -------------------
+        self._init_experts_hook()
 
+        # -------------------
+        # EM alternation config
+        # -------------------
+        self.em_alt_training = bool(em_alt_training)
+        # possible stages: "geometry", "experts", "all_unfrozen"
+        self._training_stage = (
+            "geometry" if self.em_alt_training else "all_unfrozen"
+        )
+
+        # -------------------
+        # Phase-weighted loss lambdas
+        # -------------------
+        self.lambda_task_geom = lambda_task_geom
+        self.lambda_task_expert = lambda_task_expert
+
+        self.lambda_metric_geom = lambda_metric_geom
+        self.lambda_metric_expert = lambda_metric_expert
+
+        self.lambda_proto_self_geom = lambda_proto_self_geom
+        self.lambda_proto_self_expert = lambda_proto_self_expert
+
+        self.lambda_local_geom = lambda_local_geom
+        self.lambda_local_expert = lambda_local_expert
+
+        self.lambda_consistency_geom = lambda_consistency_geom
+        self.lambda_consistency_expert = lambda_consistency_expert
+
+        # -------------------
+        # buffers for eval logging
+        # -------------------
+        self._val_preds: List[torch.Tensor] = []
+        self._val_labels: List[torch.Tensor] = []
+        self._test_preds: List[torch.Tensor] = []
+        self._test_labels: List[torch.Tensor] = []
+
+        self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    # ------------- encoding & distances -------------
-    def encode_batch(self, batch: Dict[str, Any]) -> torch.Tensor:
-        if "text" in batch:
-            embeds = self.encoder(batch["text"])
-        else:
-            kwargs = {"input_ids": batch["input_ids"]}
-            if "attention_mask" in batch:
-                kwargs["attention_mask"] = batch["attention_mask"]
-            if "token_type_ids" in batch:
-                kwargs["token_type_ids"] = batch["token_type_ids"]
-            embeds = self.encoder(**kwargs)
-        return embeds  # (B,H)
+    # ------------------------------------------------------------
+    # Hooks subclasses must implement
+    # ------------------------------------------------------------
 
-    def _current_prototype_matrix(self) -> torch.Tensor:
-        """
-        Unified accessor for the prototype matrix:
-          - free mode -> learnable bank (P, H)
-          - exemplar mode -> cached exemplar embeddings (P, H)
-        """
-        if self.prototype_mode == "free":
-            return self._prototype_bank_real.weight
-        else:
-            assert (
-                self.prototype_embeds is not None
-            ), "Exemplar prototypes not set."
-            return self.prototype_embeds
+    def _init_experts_hook(self) -> None:
+        return
 
-    def compute_distances(self, x_embed: torch.Tensor) -> torch.Tensor:
-        """
-        Always operate in normalized space.
-        Cosine: d = 1 - <x, p>
-        Euclidean: ||x - p||_2 over unit-normalized x,p (i.e., chord distance)
-        """
-        X = _normalize(x_embed)
-        P = _normalize(self._current_prototype_matrix())
-        if self.distance == "cosine":
-            # cosine distance = 1 - cosine similarity
-            # X: (B,H), P: (P,H) -> (B,P)
-            return 1.0 - torch.einsum("bh,ph->bp", X, P)
-        else:
-            # Euclidean on unit sphere (equiv. monotone to cosine)
-            return _cdist(X.unsqueeze(1), P.unsqueeze(0)).squeeze(1)
-
-    # ------------- losses -------------
-    def compute_losses(self, predictions, targets, x_embed):
-        losses = {}
-        total = torch.tensor(0.0, device=predictions.device)
-        targets = targets.view_as(predictions).to(predictions.dtype)
-        mse = F.mse_loss(predictions, targets)
-        losses["mse"] = mse
-        total = total + self.mse_weight * mse
-
-        if self.cohesion_weight > 0.0:
-            d = self.compute_distances(x_embed)
-            min_d = d.min(dim=1).values
-            cohesion = min_d.mean()
-            losses["cohesion"] = cohesion
-            total = total + self.cohesion_weight * cohesion
-
-        if self.separation_weight > 0.0 and self.prototype_mode == "free":
-            # separation on normalized prototypes
-            P = _normalize(self._current_prototype_matrix())
-            pairwise = torch.pdist(P, p=2)
-            sep = (
-                (-pairwise.mean())
-                if pairwise.numel() > 0
-                else torch.tensor(0.0, device=predictions.device)
-            )
-            losses["separation"] = sep
-            total = total + self.separation_weight * sep
-
-        losses["total"] = total
-        return losses
-
-    # ------------- head (override) -------------
-    def predict_from_embeddings(self, embeds: torch.Tensor) -> torch.Tensor:
+    def _enable_expert_training(self, flag: bool) -> None:
         raise NotImplementedError
 
-    # ------------- lightning steps -------------
-    def _shared_step(self, batch, stage="val"):
-        labels = batch["labels"].float()
-        embeds = self.encode_batch(batch)
-        preds = self.predict_from_embeddings(embeds).view(-1)
-        losses = self.compute_losses(preds, labels, embeds)
+    def _expert_outputs(
+        self,
+        value_embeds: torch.Tensor,  # (B,Dv)
+    ) -> torch.Tensor:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------
+    # Helper: enable/disable router training in EM
+    # ------------------------------------------------------------
+
+    def _enable_router_training(self, flag: bool) -> None:
+        """
+        Delegate to activation_router.enable_training(flag)
+        so that in geometry-phase we can freeze routing/gating params,
+        and in experts-phase we can unfreeze them.
+        """
+        self.activation_router.enable_training(flag)
+
+    # ------------------------------------------------------------
+    # Forward internals
+    # ------------------------------------------------------------
+
+    def _forward_internals(
+        self,
+        retrieval_embeds: torch.Tensor,  # (B,H_retrieval)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Produce predictions and all intermediates needed for loss.
+        Returns:
+            retrieval_protos: (P,H)
+            value_protos:     (P,Dv)
+            value_embeds:     (B,Dv)
+            weights:          (B,P)
+            expert_matrix:    (B,P) or (B,P,1)
+            preds:            (B,)
+        """
+        self._ensure_prototypes_ready()
+
+        retrieval_protos = (
+            self.prototype_manager.get_retrieval_prototypes()
+        )  # (P,H)
+        value_protos = self.prototype_manager.get_value_prototypes()  # (P,Dv)
+
+        value_embeds = self.prototype_manager.project_embeddings(
+            retrieval_embeds
+        )  # (B,Dv)
+
+        weights = self.activation_router(
+            retrieval_embeds=retrieval_embeds,
+            retrieval_protos=retrieval_protos,
+            value_embeds=value_embeds,
+            value_protos=value_protos,
+        )  # (B,P), row-normalized
+
+        expert_matrix = self._expert_outputs(value_embeds)  # (B,P) or (B,P,1)
+
+        preds = self._aggregate_expert_predictions(
+            expert_matrix, weights
+        )  # (B,)
+
+        return {
+            "retrieval_protos": retrieval_protos,
+            "value_protos": value_protos,
+            "value_embeds": value_embeds,
+            "weights": weights,
+            "expert_matrix": expert_matrix,
+            "preds": preds,
+        }
+
+    def forward(
+        self,
+        retrieval_embeds: torch.Tensor,
+    ) -> torch.Tensor:
+        outs = self._forward_internals(retrieval_embeds)
+        return outs["preds"]
+
+    def _aggregate_expert_predictions(
+        self,
+        expert_matrix: torch.Tensor,  # (B,P) or (B,P,1)
+        weights: torch.Tensor,  # (B,P)
+    ) -> torch.Tensor:
+        if expert_matrix.dim() == 3:
+            expert_matrix = expert_matrix.squeeze(-1)
+        preds = (weights * expert_matrix).sum(dim=1)  # (B,)
+        return preds
+
+    # ------------------------------------------------------------
+    # Loss terms
+    # ------------------------------------------------------------
+
+    def _task_loss(
+        self,
+        preds: torch.Tensor,  # (B,)
+        labels: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        labels = labels.view_as(preds).to(preds.dtype)
+        return F.mse_loss(preds, labels)
+
+    def _metric_learning_loss(
+        self,
+        retrieval_embeds: torch.Tensor,  # (B,H)
+        labels: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        value_embeds = self.prototype_manager.project_embeddings(
+            retrieval_embeds
+        )
+        return self.prototype_manager.metric_learning_loss(
+            value_embeds=value_embeds,
+            labels=labels,
+        )
+
+    def _proto_self_loss(self) -> torch.Tensor:
+        """
+        Prototype self-fit: each prototype's expert should match
+        its own anchor example's label.
+
+        Steps:
+        - Grab indices of the training examples each prototype claims to
+          represent (prototype_indices). That buffer lives on the model/device.
+        - Use those indices to pull the corresponding train embeddings + labels
+          from the datamodule caches (which live on CPU).
+        - Project those embeddings into value space.
+        - Run all experts on those projected embeddings.
+        - Compare expert p's prediction on prototype p to that prototype's
+          anchor label.
+        """
+        if self.dm is None:
+            return torch.tensor(0.0, device=self.device)
+
+        pm = self.prototype_manager
+
+        # need stored prototype_indices from PrototypeManager
+        if (
+            not hasattr(pm, "prototype_indices")
+            or pm.prototype_indices is None
+            or pm.prototype_indices.numel() == 0
+        ):
+            return torch.tensor(0.0, device=self.device)
+
+        # indices may be on CUDA (because they're a registered buffer),
+        # but dm.train_embeddings is CPU. Indexing across devices breaks,
+        # so force indices to CPU for the gather.
+        anchor_idx_cpu = pm.prototype_indices.detach().long().cpu()  # (P,)
+
+        # must have cached train embeddings / labels on the dm
+        if (
+            not hasattr(self.dm, "train_embeddings")
+            or self.dm.train_embeddings is None
+            or not hasattr(self.dm, "train_labels")
+            or self.dm.train_labels is None
+        ):
+            return torch.tensor(0.0, device=self.device)
+
+        # pull anchors from CPU store using CPU indices, then move to model device
+        retr_anchor = (
+            self.dm.train_embeddings[anchor_idx_cpu].to(self.device).float()
+        )  # (P,H)
+        y_anchor = (
+            self.dm.train_labels[anchor_idx_cpu].to(self.device).float()
+        )  # (P,)
+
+        # project anchors into value space
+        val_anchor = self.prototype_manager.project_embeddings(
+            retr_anchor
+        )  # (P,Dv)
+
+        # run all experts on those anchors
+        expert_matrix = self._expert_outputs(val_anchor)  # (P,P) or (P,P,1)
+        if expert_matrix.dim() == 3:
+            expert_matrix = expert_matrix.squeeze(-1)
+
+        # diagonal = expert p on its own prototype p
+        diag_preds = torch.diagonal(expert_matrix, dim1=0, dim2=1)  # (P,)
+        y_anchor = y_anchor.to(diag_preds.dtype)
+
+        return F.mse_loss(diag_preds, y_anchor)
+
+    def _local_loss(
+        self,
+        expert_matrix: torch.Tensor,  # (B,P)/(B,P,1)
+        weights: torch.Tensor,  # (B,P)
+        labels: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        if expert_matrix.dim() == 3:
+            expert_matrix = expert_matrix.squeeze(-1)
+        B, P = expert_matrix.shape
+        labels_col = labels.view(B, 1).to(expert_matrix.dtype)  # (B,1)
+        err_sq = (expert_matrix - labels_col) ** 2  # (B,P)
+        weighted_err = weights * err_sq  # (B,P)
+        return weighted_err.mean()
+
+    def _consistency_loss(
+        self,
+        value_embeds: torch.Tensor,  # (B,Dv)
+        value_protos: torch.Tensor,  # (P,Dv)
+        weights: torch.Tensor,  # (B,P)
+    ) -> torch.Tensor:
+        B, Dv = value_embeds.shape
+        P, Dp = value_protos.shape
+        assert Dv == Dp, "consistency_loss: dim mismatch"
+
+        vb = value_embeds.unsqueeze(1).expand(B, P, Dv)  # (B,P,Dv)
+        vp = value_protos.unsqueeze(0).expand(B, P, Dv)  # (B,P,Dv)
+
+        dist_sq = torch.sum((vb - vp) ** 2, dim=2)  # (B,P)
+        weighted = weights * dist_sq  # (B,P)
+        return weighted.mean()
+
+    # ------------------------------------------------------------
+    # Phase-aware weighting
+    # ------------------------------------------------------------
+
+    def _phase_coeffs(self) -> Dict[str, float]:
+        if self._training_stage == "geometry":
+            return {
+                "task": self.lambda_task_geom,
+                "metric": self.lambda_metric_geom,
+                "proto_self": self.lambda_proto_self_geom,
+                "local": self.lambda_local_geom,
+                "consistency": self.lambda_consistency_geom,
+            }
+        elif self._training_stage == "experts":
+            return {
+                "task": self.lambda_task_expert,
+                "metric": self.lambda_metric_expert,
+                "proto_self": self.lambda_proto_self_expert,
+                "local": self.lambda_local_expert,
+                "consistency": self.lambda_consistency_expert,
+            }
+        else:  # "all_unfrozen"
+            return {
+                "task": 0.5 * (self.lambda_task_geom + self.lambda_task_expert),
+                "metric": 0.5
+                * (self.lambda_metric_geom + self.lambda_metric_expert),
+                "proto_self": 0.5
+                * (self.lambda_proto_self_geom + self.lambda_proto_self_expert),
+                "local": 0.5
+                * (self.lambda_local_geom + self.lambda_local_expert),
+                "consistency": 0.5
+                * (
+                    self.lambda_consistency_geom
+                    + self.lambda_consistency_expert
+                ),
+            }
+
+    def _compute_total_loss(
+        self,
+        retrieval_embeds: torch.Tensor,  # (B,H)
+        labels: torch.Tensor,  # (B,)
+        internals: Dict[str, torch.Tensor],  # fwd intermediates
+    ) -> Dict[str, torch.Tensor]:
+        c = self._phase_coeffs()
+
+        preds = internals["preds"]  # (B,)
+        expert_matrix = internals["expert_matrix"]  # (B,P)/(B,P,1)
+        weights = internals["weights"]  # (B,P)
+        value_embeds = internals["value_embeds"]  # (B,Dv)
+        value_protos = internals["value_protos"]  # (P,Dv)
+
+        l_task = self._task_loss(preds, labels)
+        l_metric = self._metric_learning_loss(retrieval_embeds, labels)
+        l_pself = self._proto_self_loss()
+        l_local = self._local_loss(expert_matrix, weights, labels)
+        l_cons = self._consistency_loss(value_embeds, value_protos, weights)
+
+        total = (
+            c["task"] * l_task
+            + c["metric"] * l_metric
+            + c["proto_self"] * l_pself
+            + c["local"] * l_local
+            + c["consistency"] * l_cons
+        )
+
+        return {
+            "total": total,
+            "task": l_task.detach(),
+            "metric": l_metric.detach(),
+            "proto_self": l_pself.detach(),
+            "local": l_local.detach(),
+            "consistency": l_cons.detach(),
+        }
+
+    # ------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------
+
+    def _log_epoch_metrics(
+        self,
+        preds_list: List[torch.Tensor],
+        labels_list: List[torch.Tensor],
+        prefix: str,
+    ) -> None:
+        if not preds_list:
+            return
+        preds = torch.cat(preds_list)
+        labels = torch.cat(labels_list)
+        mse = tmf.mean_squared_error(preds, labels)
+        rho = tmf.pearson_corrcoef(preds, labels)
+        self.log(f"{prefix}_mse", mse, prog_bar=True)
+        self.log(f"{prefix}_corr", rho, prog_bar=True)
+
+    # ------------------------------------------------------------
+    # Lightning plumbing
+    # ------------------------------------------------------------
+
+    def _ensure_prototypes_ready(self) -> None:
+        """
+        Make sure prototypes are initialized exactly once.
+
+        IMPORTANT: after loading from a checkpoint we may *already*
+        have prototype params/buffers. In that case we do NOT want
+        to regenerate / overwrite them.
+        """
+        pm = self.prototype_manager
+
+        # If prototypes already exist (param or buffer), do nothing.
+        if getattr(pm, "_retrieval_prototypes_param", None) is not None:
+            return
+        if hasattr(pm, "_retrieval_prototypes_buf"):
+            return
+
+        # Otherwise we are in a fresh run and need to init from train data.
+        if (
+            self.dm is None
+            or getattr(self.dm, "train_embeddings", None) is None
+        ):
+            raise RuntimeError(
+                "EmbeddingDataModule not attached or not setup; cannot init prototypes."
+            )
+        train_cpu = self.dm.train_embeddings.detach().cpu()
+        pm.initialize_from_train_embeddings(train_cpu)
+
+    def _shared_step(self, batch: Dict[str, Any], stage: str) -> torch.Tensor:
+        retrieval_embeds = batch["embeddings"].to(self.device).float()  # (B,H)
+        labels = batch["labels"].to(self.device).float()  # (B,)
+
+        internals = self._forward_internals(retrieval_embeds)
+        losses = self._compute_total_loss(retrieval_embeds, labels, internals)
         loss = losses["total"]
 
         if stage == "train":
@@ -281,17 +504,20 @@ class BasePrototypicalRegressor(pl.LightningModule):
             )
             self.log("train_loss_epoch", loss, on_step=False, on_epoch=True)
         elif stage == "val":
-            self._val_preds.append(preds.detach().cpu())
+            preds = internals["preds"].detach().cpu()
+            self._val_preds.append(preds)
             self._val_labels.append(labels.detach().cpu())
             self.log(
                 "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True
             )
         else:
-            self._test_preds.append(preds.detach().cpu())
+            preds = internals["preds"].detach().cpu()
+            self._test_preds.append(preds)
             self._test_labels.append(labels.detach().cpu())
             self.log(
                 "test_loss", loss, on_step=False, on_epoch=True, prog_bar=True
             )
+
         return loss
 
     def training_step(self, batch, batch_idx):
@@ -303,438 +529,132 @@ class BasePrototypicalRegressor(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         self._shared_step(batch, stage="test")
 
-    # ------------- epoch metrics -------------
     def on_validation_epoch_start(self):
         self._val_preds, self._val_labels = [], []
 
     def on_validation_epoch_end(self):
-        if not self._val_preds:
-            return
-        preds = torch.cat(self._val_preds)
-        labels = torch.cat(self._val_labels)
-        mse = tmf.mean_squared_error(preds, labels)
-        rho = tmf.pearson_corrcoef(preds, labels)
-        self.log("val_mse", mse, prog_bar=True)
-        self.log("val_corr", rho, prog_bar=True)
+        self._log_epoch_metrics(self._val_preds, self._val_labels, prefix="val")
 
     def on_test_epoch_start(self):
         self._test_preds, self._test_labels = [], []
 
     def on_test_epoch_end(self):
-        if not self._test_preds:
+        self._log_epoch_metrics(
+            self._test_preds, self._test_labels, prefix="test"
+        )
+
+    # ------------------------------------------------------------
+    # EM-style alternation per epoch
+    # ------------------------------------------------------------
+
+    def on_train_epoch_start(self):
+        """
+        Flip phases if em_alt_training=True.
+
+        geometry phase:
+            - train PrototypeManager (projection head + prototypes)
+            - freeze experts and activation_router
+
+        experts phase:
+            - freeze PrototypeManager geometry
+            - train experts and activation_router
+        """
+        if not self.em_alt_training:
+            self._training_stage = "all_unfrozen"
+            # everybody ON
+            self.prototype_manager.enable_projection_training(True)
+            self.prototype_manager.enable_prototype_training(True)
+            self._enable_expert_training(True)
+            self._enable_router_training(True)
             return
-        preds = torch.cat(self._test_preds)
-        labels = torch.cat(self._test_labels)
-        mse = tmf.mean_squared_error(preds, labels)
-        rho = tmf.pearson_corrcoef(preds, labels)
-        self.log("test_mse", mse, prog_bar=True)
-        self.log("test_corr", rho, prog_bar=True)
 
-    # ---------- selection helpers ----------
-    def _detect_mode_from_batch(self, batch: Dict[str, Any]) -> str:
-        return "raw" if "text" in batch else "tokenized"
-
-    def _resolve_dm(self):
-        # prefer constructor-provided dm; fallback to trainer.datamodule if available
-        return (
-            self.dm
-            if self.dm is not None
-            else getattr(self.trainer, "datamodule", None)
-        )
-
-    def _make_ordered_train_loader(self, dm) -> DataLoader:
-        """Create a NON-shuffled train dataloader so prototype indices are stable."""
-        ds = dm.dataset["train"]
-        collate = (
-            None if getattr(dm, "tokenize_inputs", True) else dm._collate_raw
-        )
-        return DataLoader(
-            ds,
-            batch_size=dm.train_batch_size,
-            shuffle=False,  # <-- critical: no shuffle
-            collate_fn=collate,
-        )
-
-    @torch.no_grad()
-    def _gather_train_embeddings_and_examples(
-        self,
-    ) -> Tuple[torch.Tensor, Dict[str, Any], str]:
-        """
-        Encode the entire train split ONCE (non-shuffled) to build (embeds_cpu, examples, mode),
-        where examples are the minimal materials needed to re-encode selected exemplars later.
-        """
-        dm = self._resolve_dm()
-        assert dm is not None, "datamodule required for exemplar selection."
-
-        dl_ordered = self._make_ordered_train_loader(dm)
-        first = next(iter(dl_ordered))
-        mode = self._detect_mode_from_batch(first)
-        # restart the ordered loader
-        dl_ordered = self._make_ordered_train_loader(dm)
-
-        device = self.device
-        Bcat: Dict[str, List[torch.Tensor]] = {}
-        texts: List[Union[str, Tuple[str, str]]] = []
-        outs = []
-
-        self.encoder.eval()
-        print(
-            "[proto:init] Collecting Training Representations for Prototype Initialization (no shuffle)"
-        )
-        for batch in tqdm(dl_ordered):
-            if mode == "raw":
-                emb = self.encode_batch({"text": batch["text"]}).detach()
-                texts.extend([copy.deepcopy(t) for t in batch["text"]])
-            else:
-                enc = {"input_ids": batch["input_ids"].to(device)}
-                if "attention_mask" in batch:
-                    enc["attention_mask"] = batch["attention_mask"].to(device)
-                if "token_type_ids" in batch:
-                    enc["token_type_ids"] = batch["token_type_ids"].to(device)
-                emb = self.encode_batch(enc).detach()
-                for k in ("input_ids", "attention_mask", "token_type_ids"):
-                    if k in batch:
-                        Bcat.setdefault(k, [])
-                        Bcat[k].append(batch[k].cpu().clone())
-            outs.append(emb.cpu())
-
-        if any(p.requires_grad for p in self.encoder.parameters()):
-            self.encoder.train()
-
-        embeds_cpu = torch.cat(outs, dim=0)  # raw on CPU
-        examples = (
-            {"text": texts}
-            if mode == "raw"
-            else {k: torch.cat(v, dim=0) for k, v in Bcat.items()}
-        )
-        return embeds_cpu, examples, mode
-
-    @torch.no_grad()
-    def _select_indices(
-        self, embeds_cpu: torch.Tensor, k: int, method: Optional[str]
-    ) -> torch.LongTensor:
-        """
-        Selection happens in the SAME normalized space used for training/routing.
-        """
-        N = embeds_cpu.size(0)
-        if k >= N:
-            return torch.arange(N, dtype=torch.long)
-
-        embeds_cpu_n = _normalize(embeds_cpu)
-        X = embeds_cpu_n.numpy()
-
-        if method == "kmedoids":
-            self.print(f"[proto:init] KMedoids select (k={k})", flush=True)
-            km = KMedoids(
-                n_clusters=k,
-                metric="euclidean",
-                method="alternate",
-                init="k-medoids++",
-                max_iter=300,
-                random_state=self.seed,
-            )
-            km.fit(X)
-            if (
-                hasattr(km, "medoid_indices_")
-                and km.medoid_indices_ is not None
-            ):
-                idx = torch.as_tensor(km.medoid_indices_, dtype=torch.long)
-            elif (
-                hasattr(km, "medoid_indices") and km.medoid_indices is not None
-            ):
-                idx = torch.as_tensor(km.medoid_indices, dtype=torch.long)
-            else:
-                centers = getattr(km, "cluster_centers_", None) or getattr(
-                    km, "cluster_centers", None
-                )
-                if centers is not None:
-                    idx = _nearest_point_indices(embeds_cpu_n, centers, k)
-                else:
-                    idx = _farthest_first(embeds_cpu_n, k)
-
-            uniq = list(dict.fromkeys(idx.tolist()))
-            if len(uniq) < k:
-                extra = _farthest_first(
-                    embeds_cpu_n, min(k, embeds_cpu_n.size(0))
-                ).tolist()
-                pool = [i for i in extra if i not in set(uniq)]
-                uniq = uniq + pool[: (k - len(uniq))]
-            return torch.tensor(uniq[:k], dtype=torch.long)
-
-        if method == "kmeans++" or method is None:
-            self.print(f"[proto:init] KMeans++ select (k={k})", flush=True)
-            km = KMeans(
-                n_clusters=k,
-                init="k-means++",
-                n_init=k,  # <- as requested: n_init == k
-                random_state=self.seed,
-            )
-            km.fit(X)
-            centers = km.cluster_centers_
-            return _nearest_point_indices(embeds_cpu_n, centers, k)
-
-        if method == "farthest":
-            self.print(
-                f"[proto:init] Farthest-point select (k={k})", flush=True
-            )
-            return _farthest_first(embeds_cpu_n, k)
-
-        if method == "dbscan":
-            self.print("[proto:init] DBSCAN select", flush=True)
-            db = DBSCAN(eps=0.5, min_samples=5, metric="euclidean")
-            labels = db.fit_predict(X)
-            if len([l for l in set(labels) if l != -1]) >= 1:
-                idx = _cluster_means_to_indices(embeds_cpu_n, labels)
-                if idx.numel() < k:
-                    extra = _farthest_first(
-                        embeds_cpu_n, min(k, embeds_cpu_n.size(0))
-                    )
-                    pool = [
-                        i for i in extra.tolist() if i not in set(idx.tolist())
-                    ]
-                    idx = torch.tensor(
-                        idx.tolist() + pool[: (k - idx.numel())],
-                        dtype=torch.long,
-                    )
-                else:
-                    idx = idx[:k]
-                return idx
-            return self._select_indices(embeds_cpu, k, "kmeans++")
-
-        if method == "hdbscan":
-            self.print("[proto:init] HDBSCAN select", flush=True)
-            clusterer = HDBSCAN(min_cluster_size=10)
-            labels = clusterer.fit_predict(X)
-            if len([l for l in set(labels) if l != -1]) >= 1:
-                idx = _cluster_means_to_indices(embeds_cpu_n, labels)
-                if idx.numel() < k:
-                    extra = _farthest_first(
-                        embeds_cpu_n, min(k, embeds_cpu_n.size(0))
-                    )
-                    pool = [
-                        i for i in extra.tolist() if i not in set(idx.tolist())
-                    ]
-                    idx = torch.tensor(
-                        idx.tolist() + pool[: (k - idx.numel())],
-                        dtype=torch.long,
-                    )
-                else:
-                    idx = idx[:k]
-                return idx
-            return self._select_indices(embeds_cpu, k, "kmeans++")
-
-        self.print(
-            f"[proto:init] unknown selector '{method}', defaulting to KMeans++.",
-            flush=True,
-        )
-        return self._select_indices(embeds_cpu, k, "kmeans++")
-
-    @torch.no_grad()
-    def _examples_to_chunk(self, ex: Dict[str, Any]) -> Dict[str, Any]:
-        """Build a model-ready batch chunk from cached exemplar examples."""
-        if "text" in ex:
-            return {"text": list(ex["text"])}  # new list (no alias)
-        out = {"input_ids": ex["input_ids"].to(self.device)}
-        if "attention_mask" in ex:
-            out["attention_mask"] = ex["attention_mask"].to(self.device)
-        if "token_type_ids" in ex:
-            out["token_type_ids"] = ex["token_type_ids"].to(self.device)
-        return out
-
-    @torch.no_grad()
-    def _set_example_prototypes(
-        self, examples_full: Dict[str, Any], idx: torch.LongTensor
-    ):
-        """Store chosen examples + current embeddings (on model device)."""
-        if "text" in examples_full:
-            texts = [examples_full["text"][i] for i in idx.tolist()]
-            ex = {"text": [copy.deepcopy(t) for t in texts]}
+        # alternate
+        if self._training_stage == "geometry":
+            self._training_stage = "experts"
         else:
-            ex = {k: v[idx].clone() for k, v in examples_full.items()}
+            self._training_stage = "geometry"
 
-        self.prototype_examples = ex
-        emb = self.encode_batch(self._examples_to_chunk(ex)).detach()
-        self.prototype_embeds = _normalize(emb).to(self.device)
-        self.prototype_indices = idx.clone().cpu()
+        if self._training_stage == "geometry":
+            # geometry ON
+            self.prototype_manager.enable_projection_training(True)
+            self.prototype_manager.enable_prototype_training(True)
+            # experts OFF
+            self._enable_expert_training(False)
+            self._enable_router_training(False)
 
-        self.print(
-            f"[proto:init] set {idx.numel()} exemplar prototypes via '{self.prototype_selector}'. "
-            f"first 10 idx: {idx[:10].tolist()}",
-            flush=True,
-        )
+        elif self._training_stage == "experts":
+            # geometry OFF
+            self.prototype_manager.enable_projection_training(False)
+            self.prototype_manager.enable_prototype_training(False)
+            # experts ON
+            self._enable_expert_training(True)
+            self._enable_router_training(True)
 
-    @torch.no_grad()
-    def _ensure_prototypes_ready(self):
-        """If in exemplar mode and nothing is initialized yet, do a one-off selection now."""
-        if self.prototype_mode != "example":
-            return
-        if (self.prototype_embeds is not None) or (
-            self.prototype_indices is not None
-        ):
-            return
-        print("[proto:init] Initializing Example-Constrained Prototypes")
-        embeds_cpu, examples_full, _mode = (
-            self._gather_train_embeddings_and_examples()
-        )
-        k = min(self.num_prototypes, embeds_cpu.size(0))
-        idx = self._select_indices(embeds_cpu, k, self.prototype_selector)
-        self._set_example_prototypes(examples_full, idx)
-
-    def _maybe_move_prototypes_to_device(self):
-        """Ensure prototype tensors live on the same device as the module."""
-        dev = next(self.parameters()).device
+    def on_train_epoch_end(self):
+        # snap prototypes back to nearest real training example for interpretability
         if (
-            self.prototype_embeds is not None
-            and self.prototype_embeds.device != dev
+            self.dm is not None
+            and hasattr(self.dm, "train_embeddings")
+            and self.dm.train_embeddings is not None
         ):
-            self.prototype_embeds = self.prototype_embeds.to(dev)
+            self.prototype_manager.periodic_snap(
+                self.dm.train_embeddings.detach().cpu()
+            )
 
-    # ------------- trainer lifecycle hooks -------------
+    # ------------------------------------------------------------
+    # setup / optim / debug
+    # ------------------------------------------------------------
+
     def setup(self, stage: Optional[str] = None):
         if stage in (None, "fit", "validate", "test", "predict"):
             self._ensure_prototypes_ready()
-            self._maybe_move_prototypes_to_device()
 
     def on_fit_start(self):
         self._ensure_prototypes_ready()
-        self._maybe_move_prototypes_to_device()
-        self.dump_trainable_status()
-        self.print(
-            f"[hparams] mode={self.prototype_mode}, selector={self.prototype_selector}, distance={self.distance}",
-            flush=True,
-        )
+        self._dump_trainable_status()
 
-    def on_validation_start(self):
-        self._ensure_prototypes_ready()
-        self._maybe_move_prototypes_to_device()
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
 
-    def on_test_start(self):
-        self._ensure_prototypes_ready()
-        self._maybe_move_prototypes_to_device()
+    def _dump_trainable_status(self):
+        """
+        Print who's trainable right now. Mostly for sanity.
+        """
 
-    def on_after_backward(self):
-        # If encoder is trainable & example mode: refresh ONLY the P prototype embeddings each step.
-        if (
-            self.prototype_mode == "example"
-            and self.prototype_examples is not None
-            and any(p.requires_grad for p in self.encoder.parameters())
-        ):
-            with torch.no_grad():
-                chunk = self._examples_to_chunk(self.prototype_examples)
-                emb = self.encode_batch(chunk)
-                self.prototype_embeds = _normalize(emb.detach()).to(self.device)
-
-    # ------------- persist/restore in checkpoints -------------
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        checkpoint["prototype_mode"] = self.prototype_mode
-        checkpoint["num_prototypes"] = self.num_prototypes
-        checkpoint["prototype_selector"] = self.prototype_selector
-        checkpoint["distance"] = self.distance
-        checkpoint["tau"] = self.tau.detach().cpu().item()
-
-        if self.prototype_mode == "example":
-            if self.prototype_embeds is not None:
-                checkpoint["prototype_embeds"] = (
-                    self.prototype_embeds.detach().cpu()
-                )
-            if self.prototype_indices is not None:
-                checkpoint["prototype_indices"] = (
-                    self.prototype_indices.detach().cpu()
-                )
-
-            # Persist examples so refresh keeps working if we resume training
-            if self.prototype_examples is not None:
-                ex = self.prototype_examples
-                if "text" in ex:
-                    checkpoint["prototype_examples_kind"] = "raw"
-                    checkpoint["prototype_examples_text"] = list(ex["text"])
-                else:
-                    checkpoint["prototype_examples_kind"] = "tokenized"
-                    for k in ("input_ids", "attention_mask", "token_type_ids"):
-                        if k in ex:
-                            checkpoint[f"prototype_examples_{k}"] = (
-                                ex[k].detach().cpu().clone()
-                            )
-
-    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        self.prototype_mode = checkpoint.get(
-            "prototype_mode", self.prototype_mode
-        )
-        self.num_prototypes = int(
-            checkpoint.get("num_prototypes", self.num_prototypes)
-        )
-        self.prototype_selector = checkpoint.get(
-            "prototype_selector", self.prototype_selector
-        )
-        self.distance = checkpoint.get("distance", self.distance)
-        tau_val = checkpoint.get("tau", None)
-        if tau_val is not None:
-            with torch.no_grad():
-                self.tau.fill_(float(tau_val))
-
-        if self.prototype_mode == "example":
-            pe = checkpoint.get("prototype_embeds", None)
-            if pe is not None:
-                self.prototype_embeds = pe
-            pi = checkpoint.get("prototype_indices", None)
-            if pi is not None:
-                self.prototype_indices = pi
-
-            kind = checkpoint.get("prototype_examples_kind", None)
-            if kind == "raw":
-                texts = checkpoint.get("prototype_examples_text", None)
-                if texts is not None:
-                    self.prototype_examples = {"text": list(texts)}
-            elif kind == "tokenized":
-                ex: Dict[str, torch.Tensor] = {}
-                for k in ("input_ids", "attention_mask", "token_type_ids"):
-                    t = checkpoint.get(f"prototype_examples_{k}", None)
-                    if t is not None:
-                        ex[k] = t
-                if ex:
-                    self.prototype_examples = ex
-
-    # ------------- introspection -------------
-    def dump_trainable_status(self):
-        def cnt(m: nn.Module):
-            tr = sum(p.numel() for p in m.parameters() if p.requires_grad)
-            tot = sum(p.numel() for p in m.parameters())
+        def count_params(mod: nn.Module) -> Tuple[int, int]:
+            tr = sum(p.numel() for p in mod.parameters() if p.requires_grad)
+            tot = sum(p.numel() for p in mod.parameters())
             return tr, tot
 
         lines = []
-        if isinstance(self.encoder, nn.Module):
-            tr, tot = cnt(self.encoder)
-            lines.append(
-                f"[trainable] encoder: {tr:,}/{tot:,} | training={self.encoder.training}"
-            )
-        else:
-            lines.append("[trainable] encoder: (non-Module)")
 
-        if self.prototype_mode == "free":
-            trp = (
-                self._prototype_bank_real.weight.numel()
-                if self._prototype_bank_real.weight.requires_grad
-                else 0
-            )
-            lines.append(
-                f"[trainable] prototypes (free): {trp:,}/{self._prototype_bank_real.weight.numel():,}"
-            )
-        else:
-            pcount = (
-                0
-                if self.prototype_embeds is None
-                else self.prototype_embeds.numel()
-            )
-            lines.append(
-                f"[trainable] prototypes (example): params=0 | cached embeds elems={pcount:,} "
-                f"| indices set={self.prototype_indices is not None}"
-            )
+        # PrototypeManager
+        pm_tr, pm_tot = count_params(self.prototype_manager)
+        lines.append(f"[trainable] prototype_manager: {pm_tr:,}/{pm_tot:,}")
 
-        total_tr = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        # ActivationRouter
+        ar_tr, ar_tot = count_params(self.activation_router)
+        lines.append(f"[trainable] activation_router: {ar_tr:,}/{ar_tot:,}")
+
+        # Experts (rough est.)
+        expert_params_trainable = 0
+        expert_params_total = 0
+        for name, module in self.named_children():
+            if name in ["prototype_manager", "activation_router"]:
+                continue
+            if isinstance(module, nn.Module):
+                for p in module.parameters():
+                    expert_params_total += p.numel()
+                    if p.requires_grad:
+                        expert_params_trainable += p.numel()
+        lines.append(
+            f"[trainable] experts(est.): {expert_params_trainable:,}/{expert_params_total:,}"
+        )
+
+        total_trainable = sum(
+            p.numel() for p in self.parameters() if p.requires_grad
+        )
         total_all = sum(p.numel() for p in self.parameters())
-        lines.append(f"[trainable] TOTAL: {total_tr:,}/{total_all:,}")
-        self.print("\n".join(lines), flush=True)
+        lines.append(f"[trainable] TOTAL: {total_trainable:,}/{total_all:,}")
 
-    # ------------- optim -------------
-    def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        self.print("\n".join(lines), flush=True)

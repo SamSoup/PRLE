@@ -1,4 +1,7 @@
-from typing import Literal, Mapping, Any, Callable, Type
+# model/factory.py
+
+from typing import Literal, Mapping, Any, Type
+
 from .naive import NaiveExpertPRLE
 from .linear import LinearExpertPRLE
 
@@ -19,7 +22,6 @@ _REGISTRY: Mapping[str, Type] = {
 def get_model(
     model_type: ModelType,
     *,
-    encoder,
     hidden_dim: int,
     num_prototypes: int,
     **kwargs: Any,
@@ -27,16 +29,41 @@ def get_model(
     """
     Factory for PRLE models.
 
-    Common kwargs (handled by BasePrototypicalRegressor):
-      - mse_weight: float
-      - cohesion_weight: float
-      - separation_weight: float
-      - lr: float
+    Args:
+        model_type:
+            Which expert architecture to use. Currently:
+                - "naive": placeholder/baseline expert variant
+                - "linear": LinearExpertPRLE (1-layer linear regressor per prototype)
+              (Future: "mlp", "sklearn", ...)
 
-    Expert-specific kwargs (forwarded untouched):
-      - (none for naive/linear)
-      - for MLP (once enabled): mlp_layers: int, mlp_hidden: int
-      - for sklearn (once enabled): expert_type: {"knn","svm","random_forest"}, etc.
+        hidden_dim:
+            Dimensionality of retrieval-space embeddings (H). This becomes
+            BasePrototypicalRegressor.hidden_dim.
+
+        num_prototypes:
+            How many prototypes / local experts to use (P).
+
+        **kwargs:
+            Forwarded directly into the model __init__. This includes everything
+            BasePrototypicalRegressor (and subclasses) expect, e.g.:
+
+            - lr
+            - output_dir
+            - datamodule
+            - distance
+            - seed
+            - init_strategy
+            - map_strategy
+            - trainable_prototypes
+            - use_value_space
+            - proj_dim
+            - em_alt_training
+            - gating_strategy / knn_k / radius_threshold / mlp_hidden_dim
+            - lambda_* loss weights
+            - expert_init_strategy (for LinearExpertPRLE)
+
+    Returns:
+        An instance of the chosen PRLE LightningModule subclass.
     """
     key = str(model_type).lower()
     if key not in _REGISTRY:
@@ -47,7 +74,6 @@ def get_model(
 
     cls = _REGISTRY[key]
     return cls(
-        encoder=encoder,
         hidden_dim=hidden_dim,
         num_prototypes=num_prototypes,
         **kwargs,
