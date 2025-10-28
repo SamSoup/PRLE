@@ -1,6 +1,6 @@
-# model/base.py (skeleton PRLE base for frozen-encoder setting)
+# model/base.py (revised minimal PRLE skeleton, no encoder, no cohesion/separation yet)
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import os
 import torch
 import torch.nn as nn
@@ -10,7 +10,7 @@ import torchmetrics.functional as tmf
 
 
 # -------------------------------------------------
-# Low-level math helpers (core primitives)
+# Low-level math helpers
 # -------------------------------------------------
 
 
@@ -35,14 +35,12 @@ def _pairwise_distance(
 
     if metric == "cosine":
         # cosine distance = 1 - cosine similarity
-        # (B,H) @ (H,P) -> (B,P)
         return 1.0 - torch.einsum("bh,ph->bp", x_n, y_n)
     elif metric == "euclidean":
-        # euclidean distance on unit sphere ≈ chord distance
-        # torch.cdist: (B,H) vs (P,H) -> (B,P)
+        # euclidean distance on the unit sphere ~ chord distance
         return torch.cdist(x_n, y_n, p=2)
     else:
-        raise ValueError(f"Unknown metric {metric}")
+        raise ValueError(f"Unknown distance metric: {metric}")
 
 
 # -------------------------------------------------
@@ -52,8 +50,7 @@ def _pairwise_distance(
 
 class PrototypeBank(nn.Module):
     """
-    Learnable prototype vectors of shape (P,H).
-    Used in 'free' prototype mode.
+    Learnable prototype vectors of shape (P,H) when using 'free' mode.
     """
 
     def __init__(self, num_prototypes: int, hidden_dim: int):
@@ -73,78 +70,57 @@ class BasePrototypicalRegressor(pl.LightningModule):
     """
     Skeleton for Prototypical Regression with Local Experts (PRLE).
 
-    The pipeline is conceptually:
+    Assumptions in this revision:
+    - The encoder is *not part of this module*. We never forward tokens here.
+      The LightningDataModule upstream already:
+        (a) computed frozen embeddings once,
+        (b) serves batches shaped like:
+            {
+              "embeddings": FloatTensor (B,H),
+              "labels":     FloatTensor (B,)
+            }
 
-    (0) Frozen Encoder & Embeddings
-        - Outside of this module, the EmbeddingDataModule precomputes encoder
-          embeddings for each split ("train", "validation", "test").
-        - Each batch is already {"embeddings": (B,H), "labels": (B,)}.
+    - We are currently *only* doing supervised regression loss (MSE).
+      Cohesion / separation / interpretability regularizers are temporarily removed
+      and will be reintroduced later in a more principled way.
 
-    (1) Prototype Initialization / Maintenance
-        - Decide how prototypes are represented (free learnable vectors vs.
-          example-tied vectors).
-        - Decide how they are initialized (k-means++, stratified, etc.).
-        - Optionally update / snap / prune over training.
+    - Routing temperature / tau is removed. Routing is still hookable.
 
-    (2) Expert Heads
-        - Each prototype is associated with a local expert (e.g., a linear regressor).
-        - Experts map input embedding -> local prediction.
-        - Experts are trainable.
-
-    (3) Routing / Mixture Weights
-        - Given an input embedding and the prototypes, compute routing weights
-          ("who speaks for this input?").
-        - Could be softmax over negative distance, sparse gating, etc.
-
-    (4) Aggregation
-        - Combine expert predictions with routing weights to get final scalar prediction.
-
-    (5) Loss / Regularization
-        - Task loss (e.g. MSE).
-        - Prototype cohesion / coverage.
-        - Prototype separation / diversity.
-        - Any interpretability or label-consistency regularizers.
-
-    (6) Metrics / Logging
-        - e.g. MSE and Pearson r on val/test.
-
-    This base class wires the Lightning plumbing and defines hook methods
-    for each conceptual piece. Subclasses should override the hooks.
+    - The model organizes functionality into conceptual stages:
+        (1) Prototype definition / initialization
+        (2) Expert heads
+        (3) Routing / mixture weights
+        (4) Aggregation into final prediction
+        (5) Loss
+        (6) Metrics + Lightning glue
     """
 
     def __init__(
         self,
-        encoder: nn.Module,
         hidden_dim: int,
         num_prototypes: int,
-        mse_weight: float = 1.0,
-        cohesion_weight: float = 0.0,
-        separation_weight: float = 0.0,
         lr: float = 1e-4,
         output_dir: str = "outputs",
-        freeze_encoder: bool = True,
-        datamodule=None,  # will be EmbeddingDataModule
+        datamodule: Optional[pl.LightningDataModule] = None,
         prototype_mode: str = "free",  # "free" | "example"
         prototype_selector: Optional[str] = None,
         seed: int = 42,
         distance: str = "cosine",  # "cosine" | "euclidean"
-        tau_init: float = 1.0,
+        mse_weight: float = 1.0,
     ):
         super().__init__()
-        self.save_hyperparameters(ignore=["encoder", "datamodule"])
+        self.save_hyperparameters(ignore=["datamodule"])
 
         # -------------------------
-        # (0) Frozen encoder metadata (not trained here)
+        # Basic hparams
         # -------------------------
-        self.encoder = encoder
-        if isinstance(self.encoder, nn.Module):
-            for p in self.encoder.parameters():
-                p.requires_grad = False
-            self.encoder.eval()
-
         self.hidden_dim = hidden_dim
+        self.num_prototypes = int(num_prototypes)
         self.lr = lr
         self.seed = seed
+        self.mse_weight = mse_weight
+        self.distance_metric = distance.lower().strip()
+        assert self.distance_metric in {"cosine", "euclidean"}
 
         # -------------------------
         # (1) Prototype state
@@ -152,52 +128,47 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self.prototype_mode = prototype_mode.lower().strip()
         assert self.prototype_mode in {"free", "example"}
 
-        # Optional hint for how prototypes are selected in example mode
+        # Optional hint: how to pick examples when using example mode
         self.prototype_selector = (
             None if prototype_selector is None else prototype_selector.lower()
         )
 
-        self.num_prototypes = int(num_prototypes)
-        self.distance_metric = distance.lower().strip()
-        assert self.distance_metric in {"cosine", "euclidean"}
-
-        # Routing temperature / sharpness.
-        # Could later become per-prototype or input-adaptive.
-        self.tau = nn.Parameter(torch.tensor(float(tau_init)))
-
-        # Storage for prototype representations
-        # free mode: learnable PrototypeBank, no explicit indices
-        # example mode: store fixed exemplar indices + frozen vectors
+        # Storage for prototypes
+        #   - free mode: learnable PrototypeBank
+        #   - example mode: frozen exemplar embeddings + their indices into train set
         if self.prototype_mode == "free":
             self.prototype_bank = PrototypeBank(self.num_prototypes, hidden_dim)
-            self.prototype_indices = None  # (P,) LongTensor or None
-            self.prototype_embeds = None  # not used in free mode
+            self.prototype_indices: Optional[torch.LongTensor] = (
+                None  # not used
+            )
+            self.prototype_embeds: Optional[torch.Tensor] = None  # not used
         else:
-            self.prototype_bank = None  # not used in example mode
-            self.prototype_indices = None  # (P,) LongTensor
-            self.prototype_embeds = None  # (P,H) Tensor on device
+            self.prototype_bank = None
+            self.prototype_indices = None  # LongTensor (P,)
+            self.prototype_embeds = None  # Tensor (P,H) on device
+
+        # We keep a reference to the EmbeddingDataModule so we can use
+        # dm.train_embeddings to initialize example-based prototypes.
+        self.dm: Optional[pl.LightningDataModule] = datamodule
 
         # -------------------------
         # (2) Expert heads
         # -------------------------
-        # Subclasses are expected to define any expert modules here
-        # (e.g. self.experts = ModuleList([...])).
-        # We leave only a placeholder call you can override if you want.
+        # Subclasses are expected to define any expert modules here.
+        # e.g. a per-prototype linear regressor.
         self._init_experts_hook()
 
         # -------------------------
-        # (5) Loss weights / regularization strengths
+        # Bookkeeping for validation/test metrics
         # -------------------------
-        self.mse_weight = mse_weight
-        self.cohesion_weight = cohesion_weight
-        self.separation_weight = separation_weight
+        self._val_preds: List[torch.Tensor] = []
+        self._val_labels: List[torch.Tensor] = []
+        self._test_preds: List[torch.Tensor] = []
+        self._test_labels: List[torch.Tensor] = []
 
         # -------------------------
-        # bookkeeping
+        # I/O
         # -------------------------
-        self.dm = datamodule  # EmbeddingDataModule, used for prototype init
-        self._val_preds, self._val_labels = [], []
-        self._test_preds, self._test_labels = [], []
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
@@ -212,63 +183,67 @@ class BasePrototypicalRegressor(pl.LightningModule):
         """
         [TO IMPLEMENT IN SUBCLASS IF USING 'example' MODE]
 
-        Goal: choose which training points become prototypes, and cache them.
+        Goal:
+            Pick which training points become prototypes and return both their
+            indices and corresponding embedding vectors.
 
-        Inputs:
-            train_embeds: (N,H) FloatTensor of all training embeddings from dm.
-                          This is on CPU in EmbeddingDataModule by default.
+        Input:
+            train_embeds: (N,H) float32 tensor from EmbeddingDataModule.train_embeddings (CPU)
 
         Returns:
-            proto_indices: (P,) LongTensor of chosen row indices into train_embeds.
-            proto_vectors: (P,H) FloatTensor of prototype embeddings (on same device as model).
+            proto_indices: (P,) LongTensor of selected row indices
+            proto_vectors: (P,H) FloatTensor of those rows' embeddings
+                           (we'll move to the model device)
 
-        Suggested logic:
-            - Run k-means++, farthest-first, stratified by label bins, etc.
-            - Normalize proto_vectors if desired.
-
-        Default here: raise if we're in example mode and didn't override.
+        The selection policy (k-means++, farthest-first, label binning, etc.)
+        should live in subclass code.
         """
         raise NotImplementedError(
             "Subclass must implement _init_examples_as_prototypes() "
             "when prototype_mode='example'."
         )
 
-    def _ensure_prototypes_ready(self):
+    def _ensure_prototypes_ready(self) -> None:
         """
-        Called before training/validation/test.
+        Make sure we have a prototype matrix to route against.
 
-        Behavior:
-        - If prototype_mode == 'free':
-            do nothing special (prototypes are learnable params in self.prototype_bank)
-        - If prototype_mode == 'example':
-            if not yet initialized, call _init_examples_as_prototypes(...)
-            using self.dm.train_embeddings
+        - free mode:
+            prototypes are just learnable parameters in self.prototype_bank,
+            so there's nothing special to do.
+        - example mode:
+            if we haven't yet chosen exemplar prototypes,
+            call _init_examples_as_prototypes() using dm.train_embeddings.
         """
         if self.prototype_mode == "free":
-            return  # prototypes are already learnable params
+            return
 
         if self.prototype_mode == "example" and self.prototype_embeds is None:
-            # sanity checks
-            if self.dm is None or self.dm.train_embeddings is None:
+            if (
+                self.dm is None
+                or getattr(self.dm, "train_embeddings", None) is None
+            ):
                 raise RuntimeError(
                     "EmbeddingDataModule not attached or not set up; "
                     "cannot init example-based prototypes."
                 )
 
             train_cpu = self.dm.train_embeddings.detach().cpu()  # (N,H)
-            idxs, vecs = self._init_examples_as_prototypes(train_cpu)
+            proto_idx, proto_vecs = self._init_examples_as_prototypes(train_cpu)
 
             # cache them
-            self.prototype_indices = idxs.clone().cpu()  # (P,)
-            self.prototype_embeds = vecs.to(self.device).contiguous()  # (P,H)
+            self.prototype_indices = proto_idx.clone().cpu()  # (P,)
+            self.prototype_embeds = proto_vecs.to(
+                self.device
+            ).contiguous()  # (P,H)
 
     def _get_prototype_matrix(self) -> torch.Tensor:
         """
-        Returns (P,H) prototype embeddings on the correct device,
-        regardless of mode.
+        Unified accessor.
+        Returns:
+            (P,H) tensor of prototype embeddings on the correct device.
         """
         if self.prototype_mode == "free":
-            return self.prototype_bank.weight  # (P,H) learnable
+            return self.prototype_bank.weight  # (P,H) learnable parameters
         else:
             if self.prototype_embeds is None:
                 raise RuntimeError("Prototypes not initialized yet.")
@@ -282,32 +257,25 @@ class BasePrototypicalRegressor(pl.LightningModule):
         """
         Optional constructor-time setup for expert heads.
 
-        Example (for a subclass implementing per-prototype linear heads):
+        Example in subclass:
             self.experts = nn.ModuleList(
                 [nn.Linear(self.hidden_dim, 1) for _ in range(self.num_prototypes)]
             )
-
-        Base class leaves this empty.
         """
         return
 
     def _expert_outputs(
         self,
-        sample_embed: torch.Tensor,
+        sample_embed: torch.Tensor,  # (B,H)
     ) -> torch.Tensor:
         """
         [TO IMPLEMENT IN SUBCLASS]
 
-        Input:
-            sample_embed: (B,H) embeddings from the dataloader batch
-
+        Produce each prototype expert's prediction for each sample.
         Output:
-            expert_matrix: shape (B,P) or (B,P,1)
-                expert_matrix[b, j] is expert j's raw prediction on sample b.
+            expert_matrix: (B,P) or (B,P,1)
 
-        This is where each prototype's "local regressor" actually speaks.
-
-        Base class: not implemented.
+        - expert_matrix[b, j] is "what prototype j predicts" for sample b.
         """
         raise NotImplementedError(
             "_expert_outputs() must be implemented in subclass."
@@ -323,27 +291,32 @@ class BasePrototypicalRegressor(pl.LightningModule):
         proto_embed: torch.Tensor,  # (P,H)
     ) -> torch.Tensor:
         """
-        Distance between each example and each prototype.
-        Default: cosine or euclidean distance in embedding space.
-        Returns: (B,P) distances (lower = closer).
+        Default: pure geometric distance.
+        Override if you want label-aware distance, dual-space routing, etc.
         """
         return _pairwise_distance(
             sample_embed,
             proto_embed,
             metric=self.distance_metric,
-        )
+        )  # (B,P)
 
     def _compute_routing_weights(
         self,
         distances: torch.Tensor,  # (B,P)
     ) -> torch.Tensor:
         """
-        Convert distances -> mixture weights over prototypes.
-        Default: softmax(-tau * dists)
+        Convert distances -> mixture weights.
 
-        Override this hook to implement sparse gating (e.g. top-k, sparsemax).
+        We intentionally do NOT learn a temperature here yet.
+        The default is just softmax(-distance).
+
+        Override this to implement:
+          - sparse gating
+          - top-k masking
+          - learned per-prototype radii
+          - etc.
         """
-        return torch.softmax(-self.tau * distances, dim=1)  # (B,P)
+        return torch.softmax(-distances, dim=1)  # (B,P)
 
     # =================================================
     # (4) Aggregation
@@ -355,10 +328,9 @@ class BasePrototypicalRegressor(pl.LightningModule):
         weights: torch.Tensor,  # (B,P)
     ) -> torch.Tensor:
         """
-        Weighted sum over experts -> final scalar prediction per sample.
+        Weighted sum across prototypes → final scalar regression prediction.
         """
         if expert_matrix.dim() == 3:
-            # squeeze trailing dim if experts output (B,P,1)
             expert_matrix = expert_matrix.squeeze(-1)  # (B,P)
         preds = (weights * expert_matrix).sum(dim=1)  # (B,)
         return preds
@@ -368,27 +340,29 @@ class BasePrototypicalRegressor(pl.LightningModule):
         batch_embeddings: torch.Tensor,  # (B,H)
     ) -> torch.Tensor:
         """
-        End-to-end forward for inference/training:
-          1. get prototypes
-          2. compute expert outputs
-          3. compute routing weights
-          4. aggregate
+        Full forward pass for training / inference:
+            1. ensure prototypes exist
+            2. compute expert outputs
+            3. compute routing weights
+            4. aggregate
         """
+        self._ensure_prototypes_ready()
+
         proto_mat = self._get_prototype_matrix()  # (P,H)
         expert_matrix = self._expert_outputs(
             batch_embeddings
         )  # (B,P) or (B,P,1)
-        distances = self._compute_routing_distances(
+        dists = self._compute_routing_distances(
             batch_embeddings, proto_mat
         )  # (B,P)
-        weights = self._compute_routing_weights(distances)  # (B,P)
+        weights = self._compute_routing_weights(dists)  # (B,P)
         preds = self._aggregate_expert_predictions(
             expert_matrix, weights
         )  # (B,)
         return preds
 
     # =================================================
-    # (5) Loss / Regularization
+    # (5) Loss
     # =================================================
 
     def _task_loss(
@@ -397,77 +371,26 @@ class BasePrototypicalRegressor(pl.LightningModule):
         labels: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
         """
-        Main regression objective.
+        Core supervised objective (regression).
         """
         labels = labels.view_as(preds).to(preds.dtype)
         return F.mse_loss(preds, labels)
-
-    def _cohesion_loss(
-        self,
-        sample_embed: torch.Tensor,  # (B,H)
-        proto_mat: torch.Tensor,  # (P,H)
-    ) -> torch.Tensor:
-        """
-        Encourage each input to have at least one close prototype.
-        Lower distance = better "coverage".
-        """
-        if self.cohesion_weight == 0.0:
-            return torch.zeros((), device=sample_embed.device)
-
-        dists = self._compute_routing_distances(
-            sample_embed, proto_mat
-        )  # (B,P)
-        min_d = dists.min(dim=1).values  # (B,)
-        return min_d.mean()  # scalar
-
-    def _separation_loss(
-        self,
-        proto_mat: torch.Tensor,  # (P,H)
-    ) -> torch.Tensor:
-        """
-        Encourage prototypes to spread out (diversity).
-        Only meaningful for 'free' mode where proto_mat is learnable.
-        """
-        if self.separation_weight == 0.0:
-            return torch.zeros((), device=proto_mat.device)
-        if self.prototype_mode != "free":
-            return torch.zeros((), device=proto_mat.device)
-
-        # distance between normalized prototypes
-        Pn = _normalize(proto_mat)  # (P,H)
-        pairwise = torch.pdist(Pn, p=2)  # (P*(P-1)/2,)
-        if pairwise.numel() == 0:
-            return torch.zeros((), device=proto_mat.device)
-        # want them far apart -> maximize pairwise distance
-        # => negative mean distance in the loss
-        return -pairwise.mean()
 
     def _compute_total_loss(
         self,
         preds: torch.Tensor,  # (B,)
         labels: torch.Tensor,  # (B,)
-        sample_embed: torch.Tensor,  # (B,H)
+        embeds: torch.Tensor,  # (B,H)  (not currently used, but kept for future regularizers)
     ) -> Dict[str, torch.Tensor]:
         """
-        Combine task + regularizers into a dict.
+        Combine all objectives into a dict of losses to log.
+        For now, it's just MSE scaled by mse_weight.
         """
-        proto_mat = self._get_prototype_matrix()  # (P,H)
-
         mse = self._task_loss(preds, labels)
-        coh = self._cohesion_loss(sample_embed, proto_mat)
-        sep = self._separation_loss(proto_mat)
-
-        total = (
-            self.mse_weight * mse
-            + self.cohesion_weight * coh
-            + self.separation_weight * sep
-        )
-
+        total = self.mse_weight * mse
         return {
             "total": total,
             "mse": mse,
-            "cohesion": coh,
-            "separation": sep,
         }
 
     # =================================================
@@ -476,12 +399,12 @@ class BasePrototypicalRegressor(pl.LightningModule):
 
     def _log_epoch_metrics(
         self,
-        preds_list: list,
-        labels_list: list,
+        preds_list: List[torch.Tensor],
+        labels_list: List[torch.Tensor],
         prefix: str,
     ) -> None:
         """
-        Aggregate buffers and log scalar metrics like MSE / Pearson r.
+        After an epoch (val/test), compute summary stats.
         """
         if not preds_list:
             return
@@ -504,15 +427,11 @@ class BasePrototypicalRegressor(pl.LightningModule):
         stage: str,
     ) -> torch.Tensor:
         """
-        Called by training_step / validation_step / test_step.
-
+        Stage-agnostic step.
         batch is expected to have:
             batch["embeddings"]: (B,H)
             batch["labels"]:     (B,)
         """
-        # Make sure prototypes exist (esp. 'example' mode).
-        self._ensure_prototypes_ready()
-
         embeds = batch["embeddings"].to(self.device).float()  # (B,H)
         labels = batch["labels"].to(self.device).float()  # (B,)
 
@@ -520,7 +439,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         losses = self._compute_total_loss(preds, labels, embeds)
         loss = losses["total"]
 
-        # log per-step / per-epoch stats
+        # logging / buffer collection
         if stage == "train":
             self.log(
                 "train_loss", loss, on_step=True, on_epoch=False, prog_bar=True
@@ -566,33 +485,31 @@ class BasePrototypicalRegressor(pl.LightningModule):
 
     def setup(self, stage: Optional[str] = None):
         """
-        Lightning hook:
-        Ensure prototypes are initialized on device before fit/val/test loops.
+        Lightning hook: ensure prototypes exist before any training/val/test.
         """
         if stage in (None, "fit", "validate", "test", "predict"):
             self._ensure_prototypes_ready()
 
     def on_fit_start(self):
         """
-        Convenience logging of trainable params.
+        Optional debug print for sanity.
         """
         self._ensure_prototypes_ready()
         self._dump_trainable_status()
 
     def configure_optimizers(self):
         """
-        Standard Adam over all trainable params (experts + tau + free prototypes).
+        Basic Adam over all trainable params (experts, free prototypes, etc.).
         """
         return torch.optim.Adam(self.parameters(), lr=self.lr)
 
     # -------------------------------------------------
-    # Debug / bookkeeping helpers
+    # Debug helpers
     # -------------------------------------------------
 
     def _dump_trainable_status(self):
         """
-        Print trainable parameter counts for encoder / prototypes / experts.
-        This is mostly for sanity/debugging.
+        Print parameter counts for sanity.
         """
 
         def count_params(mod: nn.Module) -> Tuple[int, int]:
@@ -603,16 +520,6 @@ class BasePrototypicalRegressor(pl.LightningModule):
             return trainable, total
 
         lines = []
-
-        # encoder
-        if isinstance(self.encoder, nn.Module):
-            tr, tot = count_params(self.encoder)
-            lines.append(
-                f"[trainable] encoder(frozen): {tr:,}/{tot:,} "
-                f"| training={self.encoder.training}"
-            )
-        else:
-            lines.append("[trainable] encoder: (non-Module)")
 
         # prototypes
         if self.prototype_mode == "free":
@@ -633,7 +540,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         # experts
         expert_params = 0
         for name, mod in self.named_children():
-            if name in ["encoder", "prototype_bank"]:
+            if name in ["prototype_bank"]:
+                # skip counting prototype_bank here because we already counted it
                 continue
             if isinstance(mod, nn.Module):
                 expert_params += sum(

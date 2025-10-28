@@ -110,23 +110,25 @@ def train(config):
     # --------------------
     # Note: we pass datamodule=embed_dm so that BasePrototypicalRegressor
     # can access train_embeddings for prototype init.
-    model = get_model(
-        model_type=config.model.type,  # "linear", etc.
-        encoder=encoder,
-        hidden_dim=config.model.hidden_dim,
-        num_prototypes=config.model.num_prototypes,
-        mse_weight=getattr(config.model, "mse_weight", 1.0),
-        cohesion_weight=getattr(config.model, "cohesion_weight", 0.0),
-        separation_weight=getattr(config.model, "separation_weight", 0.0),
-        lr=config.train.learning_rate,
-        output_dir=getattr(config.model, "output_dir", "outputs"),
-        freeze_encoder=True,  # encoder won't train
-        datamodule=embed_dm,  # <-- embedding-based DM
-        prototype_mode=getattr(config.model, "prototype_mode", "free"),
-        prototype_selector=getattr(
-            config.model, "prototype_selector", "kmeans++"
-        ),
-    )
+    # NOTE: tentative subject to change
+
+    # model = get_model(
+    #     model_type=config.model.type,  # "linear", etc.
+    #     encoder=encoder,
+    #     hidden_dim=config.model.hidden_dim,
+    #     num_prototypes=config.model.num_prototypes,
+    #     mse_weight=getattr(config.model, "mse_weight", 1.0),
+    #     cohesion_weight=getattr(config.model, "cohesion_weight", 0.0),
+    #     separation_weight=getattr(config.model, "separation_weight", 0.0),
+    #     lr=config.train.learning_rate,
+    #     output_dir=getattr(config.model, "output_dir", "outputs"),
+    #     freeze_encoder=True,  # encoder won't train
+    #     datamodule=embed_dm,  # <-- embedding-based DM
+    #     prototype_mode=getattr(config.model, "prototype_mode", "free"),
+    #     prototype_selector=getattr(
+    #         config.model, "prototype_selector", "kmeans++"
+    #     ),
+    # )
 
     # --------------------
     # W&B loggers / callbacks
