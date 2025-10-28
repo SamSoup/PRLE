@@ -2,6 +2,7 @@ wandb/
 results/
 __pycache__/
 config/
+inference/test.ipynb
 
 data/WMT2020
 data/yelp

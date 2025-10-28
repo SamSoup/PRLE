@@ -1,171 +1,650 @@
-# /data/base.py
+# model/base.py (skeleton PRLE base for frozen-encoder setting)
 
-import pytorch_lightning as pl
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer
+from typing import Optional, Dict, Any, Tuple
+import os
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pytorch_lightning as pl
+import torchmetrics.functional as tmf
 
 
-class BaseRegressionDataModule(pl.LightningDataModule):
+# -------------------------------------------------
+# Low-level math helpers (core primitives)
+# -------------------------------------------------
+
+
+def _normalize(x: torch.Tensor) -> torch.Tensor:
+    """L2-normalize last dimension."""
+    return F.normalize(x, p=2, dim=-1)
+
+
+def _pairwise_distance(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    metric: str = "cosine",
+) -> torch.Tensor:
     """
-    Generic regression DataModule that can:
-      - tokenize (HuggingFace tokenizer) OR pass raw text downstream
-      - handle single-field or pair-field tokenization (via self.text_fields set in subclass/setup)
+    Compute distance between each row in x and each row in y.
+    x: (B,H)
+    y: (P,H)
+    Returns: (B,P)
+    """
+    x_n = _normalize(x)
+    y_n = _normalize(y)
 
-    Subclasses must:
-      - load `self.dataset` with splits: train/validation/test
-      - define `self.text_fields`:
-          * ["combined_text"]           -> single string per example
-          * ["sentence1", "sentence2"]  -> a pair per example
-      - call `_tokenize_splits(remove_columns=[...])` if tokenize_inputs=True
-      - OR create raw fields: "text" (string or (string,string)) and the label column
-        indicated by `self.output_column` (default: "label"). Collation will emit "labels".
+    if metric == "cosine":
+        # cosine distance = 1 - cosine similarity
+        # (B,H) @ (H,P) -> (B,P)
+        return 1.0 - torch.einsum("bh,ph->bp", x_n, y_n)
+    elif metric == "euclidean":
+        # euclidean distance on unit sphere ≈ chord distance
+        # torch.cdist: (B,H) vs (P,H) -> (B,P)
+        return torch.cdist(x_n, y_n, p=2)
+    else:
+        raise ValueError(f"Unknown metric {metric}")
+
+
+# -------------------------------------------------
+# Prototype parameter container (for 'free' mode)
+# -------------------------------------------------
+
+
+class PrototypeBank(nn.Module):
+    """
+    Learnable prototype vectors of shape (P,H).
+    Used in 'free' prototype mode.
     """
 
-    # Columns used when tokenizing with HF tokenizer
-    loader_columns = [
-        "datasets_idx",
-        "input_ids",
-        "token_type_ids",
-        "attention_mask",
-        "start_positions",
-        "end_positions",
-        "labels",
-    ]
+    def __init__(self, num_prototypes: int, hidden_dim: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(num_prototypes, hidden_dim))
+
+    def forward(self) -> torch.Tensor:
+        return self.weight  # (P,H)
+
+
+# -------------------------------------------------
+# Base LightningModule
+# -------------------------------------------------
+
+
+class BasePrototypicalRegressor(pl.LightningModule):
+    """
+    Skeleton for Prototypical Regression with Local Experts (PRLE).
+
+    The pipeline is conceptually:
+
+    (0) Frozen Encoder & Embeddings
+        - Outside of this module, the EmbeddingDataModule precomputes encoder
+          embeddings for each split ("train", "validation", "test").
+        - Each batch is already {"embeddings": (B,H), "labels": (B,)}.
+
+    (1) Prototype Initialization / Maintenance
+        - Decide how prototypes are represented (free learnable vectors vs.
+          example-tied vectors).
+        - Decide how they are initialized (k-means++, stratified, etc.).
+        - Optionally update / snap / prune over training.
+
+    (2) Expert Heads
+        - Each prototype is associated with a local expert (e.g., a linear regressor).
+        - Experts map input embedding -> local prediction.
+        - Experts are trainable.
+
+    (3) Routing / Mixture Weights
+        - Given an input embedding and the prototypes, compute routing weights
+          ("who speaks for this input?").
+        - Could be softmax over negative distance, sparse gating, etc.
+
+    (4) Aggregation
+        - Combine expert predictions with routing weights to get final scalar prediction.
+
+    (5) Loss / Regularization
+        - Task loss (e.g. MSE).
+        - Prototype cohesion / coverage.
+        - Prototype separation / diversity.
+        - Any interpretability or label-consistency regularizers.
+
+    (6) Metrics / Logging
+        - e.g. MSE and Pearson r on val/test.
+
+    This base class wires the Lightning plumbing and defines hook methods
+    for each conceptual piece. Subclasses should override the hooks.
+    """
 
     def __init__(
         self,
-        model_name_or_path: str,
-        max_seq_length: int = 128,
-        train_batch_size: int = 32,
-        eval_batch_size: int = 32,
-        tokenize_inputs: bool = True,
-        output_column: str = "label",  # <-- name of label column in the source dataset
-        **kwargs,
+        encoder: nn.Module,
+        hidden_dim: int,
+        num_prototypes: int,
+        mse_weight: float = 1.0,
+        cohesion_weight: float = 0.0,
+        separation_weight: float = 0.0,
+        lr: float = 1e-4,
+        output_dir: str = "outputs",
+        freeze_encoder: bool = True,
+        datamodule=None,  # will be EmbeddingDataModule
+        prototype_mode: str = "free",  # "free" | "example"
+        prototype_selector: Optional[str] = None,
+        seed: int = 42,
+        distance: str = "cosine",  # "cosine" | "euclidean"
+        tau_init: float = 1.0,
     ):
         super().__init__()
-        self.model_name_or_path = model_name_or_path
-        self.max_seq_length = max_seq_length
-        self.train_batch_size = train_batch_size
-        self.eval_batch_size = eval_batch_size
-        self.tokenize_inputs = tokenize_inputs
-        self.output_column = output_column
+        self.save_hyperparameters(ignore=["encoder", "datamodule"])
 
-        self.tokenizer = (
-            AutoTokenizer.from_pretrained(
-                self.model_name_or_path, use_fast=True
-            )
-            if self.tokenize_inputs
-            else None
+        # -------------------------
+        # (0) Frozen encoder metadata (not trained here)
+        # -------------------------
+        self.encoder = encoder
+        if isinstance(self.encoder, nn.Module):
+            for p in self.encoder.parameters():
+                p.requires_grad = False
+            self.encoder.eval()
+
+        self.hidden_dim = hidden_dim
+        self.lr = lr
+        self.seed = seed
+
+        # -------------------------
+        # (1) Prototype state
+        # -------------------------
+        self.prototype_mode = prototype_mode.lower().strip()
+        assert self.prototype_mode in {"free", "example"}
+
+        # Optional hint for how prototypes are selected in example mode
+        self.prototype_selector = (
+            None if prototype_selector is None else prototype_selector.lower()
         )
 
-        self.dataset = None
-        self.columns = None
-        self.eval_splits = []
-        # Subclass should set this during setup() to either:
-        #   ["combined_text"] OR ["sentence1", "sentence2"]
-        self.text_fields = None
+        self.num_prototypes = int(num_prototypes)
+        self.distance_metric = distance.lower().strip()
+        assert self.distance_metric in {"cosine", "euclidean"}
 
-    def setup(self, stage: str = None):
-        raise NotImplementedError(
-            "Each dataset-specific DataModule must override `setup()`"
-        )
+        # Routing temperature / sharpness.
+        # Could later become per-prototype or input-adaptive.
+        self.tau = nn.Parameter(torch.tensor(float(tau_init)))
 
-    # -------- dataloaders --------
-    def train_dataloader(self):
-        return DataLoader(
-            self.dataset["train"],
-            batch_size=self.train_batch_size,
-            shuffle=True,
-            collate_fn=None if self.tokenize_inputs else self._collate_raw,
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.dataset["validation"],
-            batch_size=self.eval_batch_size,
-            collate_fn=None if self.tokenize_inputs else self._collate_raw,
-        )
-
-    def test_dataloader(self):
-        return DataLoader(
-            self.dataset["test"],
-            batch_size=self.eval_batch_size,
-            collate_fn=None if self.tokenize_inputs else self._collate_raw,
-        )
-
-    # -------- helpers --------
-    def _collate_raw(self, batch):
-        """
-        Collate raw text examples (no tokenization).
-        Expects each item to have:
-          - "text": str OR tuple(str, str)
-          - label under either "labels" or `self.output_column`
-        Returns:
-          { "text": List[str] or List[Tuple[str,str]], "labels": Tensor[B] }
-        """
-        texts = [ex["text"] for ex in batch]
-        # accept either normalized "labels" or original dataset column name
-        labels_list = []
-        for ex in batch:
-            if "labels" in ex:
-                labels_list.append(float(ex["labels"]))
-            else:
-                labels_list.append(float(ex[self.output_column]))
-        labels = torch.tensor(labels_list, dtype=torch.float32)
-        return {"text": texts, "labels": labels}
-
-    def _tokenize_splits(self, remove_columns):
-        """
-        Tokenize using self.text_fields:
-          - If len(self.text_fields) == 1: tokenizes a single string field (e.g., "combined_text")
-          - If len(self.text_fields) == 2: tokenizes a pair (sentence1, sentence2)
-        """
-        if not self.tokenize_inputs:
-            raise RuntimeError(
-                "Called _tokenize_splits while tokenize_inputs=False."
-            )
-        if not self.text_fields:
-            raise RuntimeError(
-                "self.text_fields must be set before calling _tokenize_splits()."
-            )
-        if len(self.text_fields) not in (1, 2):
-            raise ValueError("self.text_fields must have length 1 or 2.")
-
-        for split in self.dataset.keys():
-            print(f"Processing split: {split}")
-            self.dataset[split] = self.dataset[split].map(
-                self._tokenize, batched=True, remove_columns=remove_columns
-            )
-            self.columns = [
-                c
-                for c in self.dataset[split].column_names
-                if c in self.loader_columns
-            ]
-            print(f"Using columns: {self.columns}")
-            self.dataset[split].set_format(type="torch", columns=self.columns)
-            if "validation" in split:
-                self.eval_splits.append(split)
-
-    def _tokenize(self, example_batch, indices=None):
-        # Build batch as either a list[str] or a list[Tuple[str,str]]
-        if len(self.text_fields) == 1:
-            texts_or_text_pairs = example_batch[self.text_fields[0]]
+        # Storage for prototype representations
+        # free mode: learnable PrototypeBank, no explicit indices
+        # example mode: store fixed exemplar indices + frozen vectors
+        if self.prototype_mode == "free":
+            self.prototype_bank = PrototypeBank(self.num_prototypes, hidden_dim)
+            self.prototype_indices = None  # (P,) LongTensor or None
+            self.prototype_embeds = None  # not used in free mode
         else:
-            texts_or_text_pairs = list(
-                zip(
-                    example_batch[self.text_fields[0]],
-                    example_batch[self.text_fields[1]],
+            self.prototype_bank = None  # not used in example mode
+            self.prototype_indices = None  # (P,) LongTensor
+            self.prototype_embeds = None  # (P,H) Tensor on device
+
+        # -------------------------
+        # (2) Expert heads
+        # -------------------------
+        # Subclasses are expected to define any expert modules here
+        # (e.g. self.experts = ModuleList([...])).
+        # We leave only a placeholder call you can override if you want.
+        self._init_experts_hook()
+
+        # -------------------------
+        # (5) Loss weights / regularization strengths
+        # -------------------------
+        self.mse_weight = mse_weight
+        self.cohesion_weight = cohesion_weight
+        self.separation_weight = separation_weight
+
+        # -------------------------
+        # bookkeeping
+        # -------------------------
+        self.dm = datamodule  # EmbeddingDataModule, used for prototype init
+        self._val_preds, self._val_labels = [], []
+        self._test_preds, self._test_labels = [], []
+        self.output_dir = output_dir
+        os.makedirs(self.output_dir, exist_ok=True)
+
+    # =================================================
+    # (1) Prototype Initialization / Maintenance hooks
+    # =================================================
+
+    def _init_examples_as_prototypes(
+        self,
+        train_embeds: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        [TO IMPLEMENT IN SUBCLASS IF USING 'example' MODE]
+
+        Goal: choose which training points become prototypes, and cache them.
+
+        Inputs:
+            train_embeds: (N,H) FloatTensor of all training embeddings from dm.
+                          This is on CPU in EmbeddingDataModule by default.
+
+        Returns:
+            proto_indices: (P,) LongTensor of chosen row indices into train_embeds.
+            proto_vectors: (P,H) FloatTensor of prototype embeddings (on same device as model).
+
+        Suggested logic:
+            - Run k-means++, farthest-first, stratified by label bins, etc.
+            - Normalize proto_vectors if desired.
+
+        Default here: raise if we're in example mode and didn't override.
+        """
+        raise NotImplementedError(
+            "Subclass must implement _init_examples_as_prototypes() "
+            "when prototype_mode='example'."
+        )
+
+    def _ensure_prototypes_ready(self):
+        """
+        Called before training/validation/test.
+
+        Behavior:
+        - If prototype_mode == 'free':
+            do nothing special (prototypes are learnable params in self.prototype_bank)
+        - If prototype_mode == 'example':
+            if not yet initialized, call _init_examples_as_prototypes(...)
+            using self.dm.train_embeddings
+        """
+        if self.prototype_mode == "free":
+            return  # prototypes are already learnable params
+
+        if self.prototype_mode == "example" and self.prototype_embeds is None:
+            # sanity checks
+            if self.dm is None or self.dm.train_embeddings is None:
+                raise RuntimeError(
+                    "EmbeddingDataModule not attached or not set up; "
+                    "cannot init example-based prototypes."
                 )
+
+            train_cpu = self.dm.train_embeddings.detach().cpu()  # (N,H)
+            idxs, vecs = self._init_examples_as_prototypes(train_cpu)
+
+            # cache them
+            self.prototype_indices = idxs.clone().cpu()  # (P,)
+            self.prototype_embeds = vecs.to(self.device).contiguous()  # (P,H)
+
+    def _get_prototype_matrix(self) -> torch.Tensor:
+        """
+        Returns (P,H) prototype embeddings on the correct device,
+        regardless of mode.
+        """
+        if self.prototype_mode == "free":
+            return self.prototype_bank.weight  # (P,H) learnable
+        else:
+            if self.prototype_embeds is None:
+                raise RuntimeError("Prototypes not initialized yet.")
+            return self.prototype_embeds  # (P,H) frozen snapshot
+
+    # =================================================
+    # (2) Expert Heads
+    # =================================================
+
+    def _init_experts_hook(self) -> None:
+        """
+        Optional constructor-time setup for expert heads.
+
+        Example (for a subclass implementing per-prototype linear heads):
+            self.experts = nn.ModuleList(
+                [nn.Linear(self.hidden_dim, 1) for _ in range(self.num_prototypes)]
             )
 
-        features = self.tokenizer.batch_encode_plus(
-            texts_or_text_pairs,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=self.max_seq_length,
+        Base class leaves this empty.
+        """
+        return
+
+    def _expert_outputs(
+        self,
+        sample_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        [TO IMPLEMENT IN SUBCLASS]
+
+        Input:
+            sample_embed: (B,H) embeddings from the dataloader batch
+
+        Output:
+            expert_matrix: shape (B,P) or (B,P,1)
+                expert_matrix[b, j] is expert j's raw prediction on sample b.
+
+        This is where each prototype's "local regressor" actually speaks.
+
+        Base class: not implemented.
+        """
+        raise NotImplementedError(
+            "_expert_outputs() must be implemented in subclass."
         )
-        # Normalize the dataset's label column name -> "labels"
-        features["labels"] = example_batch[self.output_column]
-        return features
+
+    # =================================================
+    # (3) Routing / Mixture Weights
+    # =================================================
+
+    def _compute_routing_distances(
+        self,
+        sample_embed: torch.Tensor,  # (B,H)
+        proto_embed: torch.Tensor,  # (P,H)
+    ) -> torch.Tensor:
+        """
+        Distance between each example and each prototype.
+        Default: cosine or euclidean distance in embedding space.
+        Returns: (B,P) distances (lower = closer).
+        """
+        return _pairwise_distance(
+            sample_embed,
+            proto_embed,
+            metric=self.distance_metric,
+        )
+
+    def _compute_routing_weights(
+        self,
+        distances: torch.Tensor,  # (B,P)
+    ) -> torch.Tensor:
+        """
+        Convert distances -> mixture weights over prototypes.
+        Default: softmax(-tau * dists)
+
+        Override this hook to implement sparse gating (e.g. top-k, sparsemax).
+        """
+        return torch.softmax(-self.tau * distances, dim=1)  # (B,P)
+
+    # =================================================
+    # (4) Aggregation
+    # =================================================
+
+    def _aggregate_expert_predictions(
+        self,
+        expert_matrix: torch.Tensor,  # (B,P) or (B,P,1)
+        weights: torch.Tensor,  # (B,P)
+    ) -> torch.Tensor:
+        """
+        Weighted sum over experts -> final scalar prediction per sample.
+        """
+        if expert_matrix.dim() == 3:
+            # squeeze trailing dim if experts output (B,P,1)
+            expert_matrix = expert_matrix.squeeze(-1)  # (B,P)
+        preds = (weights * expert_matrix).sum(dim=1)  # (B,)
+        return preds
+
+    def forward(
+        self,
+        batch_embeddings: torch.Tensor,  # (B,H)
+    ) -> torch.Tensor:
+        """
+        End-to-end forward for inference/training:
+          1. get prototypes
+          2. compute expert outputs
+          3. compute routing weights
+          4. aggregate
+        """
+        proto_mat = self._get_prototype_matrix()  # (P,H)
+        expert_matrix = self._expert_outputs(
+            batch_embeddings
+        )  # (B,P) or (B,P,1)
+        distances = self._compute_routing_distances(
+            batch_embeddings, proto_mat
+        )  # (B,P)
+        weights = self._compute_routing_weights(distances)  # (B,P)
+        preds = self._aggregate_expert_predictions(
+            expert_matrix, weights
+        )  # (B,)
+        return preds
+
+    # =================================================
+    # (5) Loss / Regularization
+    # =================================================
+
+    def _task_loss(
+        self,
+        preds: torch.Tensor,  # (B,)
+        labels: torch.Tensor,  # (B,)
+    ) -> torch.Tensor:
+        """
+        Main regression objective.
+        """
+        labels = labels.view_as(preds).to(preds.dtype)
+        return F.mse_loss(preds, labels)
+
+    def _cohesion_loss(
+        self,
+        sample_embed: torch.Tensor,  # (B,H)
+        proto_mat: torch.Tensor,  # (P,H)
+    ) -> torch.Tensor:
+        """
+        Encourage each input to have at least one close prototype.
+        Lower distance = better "coverage".
+        """
+        if self.cohesion_weight == 0.0:
+            return torch.zeros((), device=sample_embed.device)
+
+        dists = self._compute_routing_distances(
+            sample_embed, proto_mat
+        )  # (B,P)
+        min_d = dists.min(dim=1).values  # (B,)
+        return min_d.mean()  # scalar
+
+    def _separation_loss(
+        self,
+        proto_mat: torch.Tensor,  # (P,H)
+    ) -> torch.Tensor:
+        """
+        Encourage prototypes to spread out (diversity).
+        Only meaningful for 'free' mode where proto_mat is learnable.
+        """
+        if self.separation_weight == 0.0:
+            return torch.zeros((), device=proto_mat.device)
+        if self.prototype_mode != "free":
+            return torch.zeros((), device=proto_mat.device)
+
+        # distance between normalized prototypes
+        Pn = _normalize(proto_mat)  # (P,H)
+        pairwise = torch.pdist(Pn, p=2)  # (P*(P-1)/2,)
+        if pairwise.numel() == 0:
+            return torch.zeros((), device=proto_mat.device)
+        # want them far apart -> maximize pairwise distance
+        # => negative mean distance in the loss
+        return -pairwise.mean()
+
+    def _compute_total_loss(
+        self,
+        preds: torch.Tensor,  # (B,)
+        labels: torch.Tensor,  # (B,)
+        sample_embed: torch.Tensor,  # (B,H)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Combine task + regularizers into a dict.
+        """
+        proto_mat = self._get_prototype_matrix()  # (P,H)
+
+        mse = self._task_loss(preds, labels)
+        coh = self._cohesion_loss(sample_embed, proto_mat)
+        sep = self._separation_loss(proto_mat)
+
+        total = (
+            self.mse_weight * mse
+            + self.cohesion_weight * coh
+            + self.separation_weight * sep
+        )
+
+        return {
+            "total": total,
+            "mse": mse,
+            "cohesion": coh,
+            "separation": sep,
+        }
+
+    # =================================================
+    # (6) Metrics / Logging
+    # =================================================
+
+    def _log_epoch_metrics(
+        self,
+        preds_list: list,
+        labels_list: list,
+        prefix: str,
+    ) -> None:
+        """
+        Aggregate buffers and log scalar metrics like MSE / Pearson r.
+        """
+        if not preds_list:
+            return
+        preds = torch.cat(preds_list)
+        labels = torch.cat(labels_list)
+
+        mse = tmf.mean_squared_error(preds, labels)
+        rho = tmf.pearson_corrcoef(preds, labels)
+
+        self.log(f"{prefix}_mse", mse, prog_bar=True)
+        self.log(f"{prefix}_corr", rho, prog_bar=True)
+
+    # =================================================
+    # Lightning-required plumbing
+    # =================================================
+
+    def _shared_step(
+        self,
+        batch: Dict[str, Any],
+        stage: str,
+    ) -> torch.Tensor:
+        """
+        Called by training_step / validation_step / test_step.
+
+        batch is expected to have:
+            batch["embeddings"]: (B,H)
+            batch["labels"]:     (B,)
+        """
+        # Make sure prototypes exist (esp. 'example' mode).
+        self._ensure_prototypes_ready()
+
+        embeds = batch["embeddings"].to(self.device).float()  # (B,H)
+        labels = batch["labels"].to(self.device).float()  # (B,)
+
+        preds = self.forward(embeds).view(-1)  # (B,)
+        losses = self._compute_total_loss(preds, labels, embeds)
+        loss = losses["total"]
+
+        # log per-step / per-epoch stats
+        if stage == "train":
+            self.log(
+                "train_loss", loss, on_step=True, on_epoch=False, prog_bar=True
+            )
+            self.log("train_loss_epoch", loss, on_step=False, on_epoch=True)
+        elif stage == "val":
+            self._val_preds.append(preds.detach().cpu())
+            self._val_labels.append(labels.detach().cpu())
+            self.log(
+                "val_loss", loss, on_step=False, on_epoch=True, prog_bar=True
+            )
+        elif stage == "test":
+            self._test_preds.append(preds.detach().cpu())
+            self._test_labels.append(labels.detach().cpu())
+            self.log(
+                "test_loss", loss, on_step=False, on_epoch=True, prog_bar=True
+            )
+
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        return self._shared_step(batch, stage="train")
+
+    def validation_step(self, batch, batch_idx):
+        self._shared_step(batch, stage="val")
+
+    def test_step(self, batch, batch_idx):
+        self._shared_step(batch, stage="test")
+
+    def on_validation_epoch_start(self):
+        self._val_preds, self._val_labels = [], []
+
+    def on_validation_epoch_end(self):
+        self._log_epoch_metrics(self._val_preds, self._val_labels, prefix="val")
+
+    def on_test_epoch_start(self):
+        self._test_preds, self._test_labels = [], []
+
+    def on_test_epoch_end(self):
+        self._log_epoch_metrics(
+            self._test_preds, self._test_labels, prefix="test"
+        )
+
+    def setup(self, stage: Optional[str] = None):
+        """
+        Lightning hook:
+        Ensure prototypes are initialized on device before fit/val/test loops.
+        """
+        if stage in (None, "fit", "validate", "test", "predict"):
+            self._ensure_prototypes_ready()
+
+    def on_fit_start(self):
+        """
+        Convenience logging of trainable params.
+        """
+        self._ensure_prototypes_ready()
+        self._dump_trainable_status()
+
+    def configure_optimizers(self):
+        """
+        Standard Adam over all trainable params (experts + tau + free prototypes).
+        """
+        return torch.optim.Adam(self.parameters(), lr=self.lr)
+
+    # -------------------------------------------------
+    # Debug / bookkeeping helpers
+    # -------------------------------------------------
+
+    def _dump_trainable_status(self):
+        """
+        Print trainable parameter counts for encoder / prototypes / experts.
+        This is mostly for sanity/debugging.
+        """
+
+        def count_params(mod: nn.Module) -> Tuple[int, int]:
+            trainable = sum(
+                p.numel() for p in mod.parameters() if p.requires_grad
+            )
+            total = sum(p.numel() for p in mod.parameters())
+            return trainable, total
+
+        lines = []
+
+        # encoder
+        if isinstance(self.encoder, nn.Module):
+            tr, tot = count_params(self.encoder)
+            lines.append(
+                f"[trainable] encoder(frozen): {tr:,}/{tot:,} "
+                f"| training={self.encoder.training}"
+            )
+        else:
+            lines.append("[trainable] encoder: (non-Module)")
+
+        # prototypes
+        if self.prototype_mode == "free":
+            tr, tot = count_params(self.prototype_bank)
+            lines.append(f"[trainable] prototypes(free): {tr:,}/{tot:,}")
+        else:
+            pcount = (
+                0
+                if self.prototype_embeds is None
+                else self.prototype_embeds.numel()
+            )
+            lines.append(
+                f"[trainable] prototypes(example): params=0 | "
+                f"cached_embed_elems={pcount:,} | "
+                f"indices_set={self.prototype_indices is not None}"
+            )
+
+        # experts
+        expert_params = 0
+        for name, mod in self.named_children():
+            if name in ["encoder", "prototype_bank"]:
+                continue
+            if isinstance(mod, nn.Module):
+                expert_params += sum(
+                    p.numel() for p in mod.parameters() if p.requires_grad
+                )
+        lines.append(f"[trainable] experts(est.): {expert_params:,}")
+
+        total_trainable = sum(
+            p.numel() for p in self.parameters() if p.requires_grad
+        )
+        total_all = sum(p.numel() for p in self.parameters())
+        lines.append(f"[trainable] TOTAL: {total_trainable:,}/{total_all:,}")
+
+        self.print("\n".join(lines), flush=True)
