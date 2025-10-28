@@ -50,7 +50,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         gating_strategy: str = "softmax",  # "knn" | "radius" | "softmax" | "mlp_sparse"
         knn_k: int = 3,
         radius_threshold: float = 0.5,
-        mlp_hidden_dim: int = 64,
+        activation_mlp_hidden_dim: int = 64,
+        expert_mlp_hidden_dim: int = 64,
         # loss weighting per phase
         lambda_task_geom: float = 1.0,
         lambda_task_expert: float = 1.0,
@@ -64,6 +65,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         lambda_consistency_expert: float = 1.0,
     ):
         super().__init__()
+        self.expert_mlp_hidden_dim = int(expert_mlp_hidden_dim)
         self.save_hyperparameters(ignore=["datamodule"])
 
         # -------------------
@@ -104,7 +106,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
             knn_k=knn_k,
             radius_threshold=radius_threshold,
             proj_dim=self.prototype_manager.proj_dim,
-            mlp_hidden_dim=mlp_hidden_dim,
+            mlp_hidden_dim=activation_mlp_hidden_dim,
         )
 
         # -------------------

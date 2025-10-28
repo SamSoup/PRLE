@@ -168,7 +168,9 @@ def train(config):
         gating_strategy=getattr(config.model, "gating_strategy", "softmax"),
         knn_k=getattr(config.model, "knn_k", 3),
         radius_threshold=getattr(config.model, "radius_threshold", 0.5),
-        mlp_hidden_dim=getattr(config.model, "mlp_hidden_dim", 64),
+        activation_mlp_hidden_dim=getattr(
+            config.model, "activation_mlp_hidden_dim", 64
+        ),
         # --- loss lambda weights (geometry phase) ---
         lambda_task_geom=getattr(config.loss, "lambda_task_geom", 1.0),
         lambda_metric_geom=getattr(config.loss, "lambda_metric_geom", 1.0),
@@ -193,6 +195,8 @@ def train(config):
         expert_init_strategy=getattr(
             config.model, "expert_init_strategy", "random"
         ),
+        # --- (optional) hidden dim for MLPExpertPRLE ---
+        expert_mlp_hidden_dim=config.model.get("expert_mlp_hidden_dim", 32),
     )
 
     # -------------------------------------------------
@@ -272,7 +276,12 @@ def train(config):
         gating_strategy=getattr(config.model, "gating_strategy", "softmax"),
         knn_k=getattr(config.model, "knn_k", 3),
         radius_threshold=getattr(config.model, "radius_threshold", 0.5),
-        mlp_hidden_dim=getattr(config.model, "mlp_hidden_dim", 64),
+        activation_mlp_hidden_dim=getattr(
+            config.model, "activation_mlp_hidden_dim", 64
+        ),
+        expert_mlp_hidden_dim=getattr(
+            config.model, "expert_mlp_hidden_dim", 32
+        ),
         lambda_task_geom=getattr(config.loss, "lambda_task_geom", 1.0),
         lambda_metric_geom=getattr(config.loss, "lambda_metric_geom", 1.0),
         lambda_proto_self_geom=getattr(

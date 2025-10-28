@@ -177,7 +177,7 @@ class SoftmaxRouter(ActivationRouter):
         self,
         distance_metric: str,
         tau_init: float = 1.0,
-        tau_min: float = 0.1,
+        tau_min: float = 0.5,
         tau_max: float = 10.0,
         anneal_gamma: float = 0.95,
     ):

@@ -4,17 +4,18 @@ from typing import Literal, Mapping, Any, Type
 
 from .naive import NaiveExpertPRLE
 from .linear import LinearExpertPRLE
+from .mlp import MLPExpertPRLE  # <— new
 
-# from .mlp import MLPExpertPRLE
+# (future)
 # from .sklearn import SklearnExpertPRLE
 
-ModelType = Literal["naive", "linear"]  # extend to "mlp", "sklearn" when added
+ModelType = Literal["naive", "linear", "mlp"]  # extend later with "sklearn"
 
 # Registry pattern so adding new experts is just one line here.
 _REGISTRY: Mapping[str, Type] = {
     "naive": NaiveExpertPRLE,
     "linear": LinearExpertPRLE,
-    # "mlp": MLPExpertPRLE,
+    "mlp": MLPExpertPRLE,
     # "sklearn": SklearnExpertPRLE,
 }
 
@@ -32,9 +33,10 @@ def get_model(
     Args:
         model_type:
             Which expert architecture to use. Currently:
-                - "naive": placeholder/baseline expert variant
+                - "naive": baseline expert variant
                 - "linear": LinearExpertPRLE (1-layer linear regressor per prototype)
-              (Future: "mlp", "sklearn", ...)
+                - "mlp":   MLPExpertPRLE (tiny MLP per prototype)
+              (Future: "sklearn", ...)
 
         hidden_dim:
             Dimensionality of retrieval-space embeddings (H). This becomes
@@ -45,7 +47,7 @@ def get_model(
 
         **kwargs:
             Forwarded directly into the model __init__. This includes everything
-            BasePrototypicalRegressor (and subclasses) expect, e.g.:
+            BasePrototypicalRegressor (and subclasses) expect, for example:
 
             - lr
             - output_dir
@@ -60,7 +62,8 @@ def get_model(
             - em_alt_training
             - gating_strategy / knn_k / radius_threshold / mlp_hidden_dim
             - lambda_* loss weights
-            - expert_init_strategy (for LinearExpertPRLE)
+            - expert_init_strategy (for LinearExpertPRLE / MLPExpertPRLE)
+            - mlp_hidden_dim (for MLPExpertPRLE)
 
     Returns:
         An instance of the chosen PRLE LightningModule subclass.
