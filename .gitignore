@@ -1,0 +1,10 @@
+wandb/
+results/
+__pycache__/
+config/
+
+data/WMT2020
+data/yelp
+
+notes.md
+results.md
