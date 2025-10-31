@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Dict, Any
 import pytorch_lightning as pl
 from .base import PrototypeManager, InitStrategy, MapStrategy, DistanceMetric
 
@@ -13,6 +13,8 @@ def build_prototype_manager(
     distance_metric: DistanceMetric,
     trainable_prototypes: bool,
     use_value_space: bool,
+    projection_type: str = "linear",
+    projection_kwargs: Optional[Dict[str, Any]] = None,
     seed: int = 42,
 ) -> PrototypeManager:
     """
@@ -28,6 +30,8 @@ def build_prototype_manager(
         distance_metric=distance_metric,
         trainable_prototypes=trainable_prototypes,
         use_value_space=use_value_space,
+        projection_type=projection_type,
+        projection_kwargs=projection_kwargs,
         seed=seed,
     )
     return manager

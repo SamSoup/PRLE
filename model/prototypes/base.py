@@ -1,6 +1,6 @@
 # model/prototypes/base.py
 
-from typing import Optional, Tuple, Literal
+from typing import Optional, Tuple, Literal, Dict, Any
 import random
 import torch
 import torch.nn as nn
@@ -10,6 +10,7 @@ from torch import Tensor
 from sklearn_extra.cluster import KMedoids
 from sklearn.cluster import KMeans
 
+from .projection_heads import build_projection_head
 
 InitStrategy = Literal[
     "random",  # random Gaussian vectors, not tied to real examples
@@ -90,6 +91,8 @@ class PrototypeManager(nn.Module):
         distance_metric: DistanceMetric,
         trainable_prototypes: bool,
         use_value_space: bool,
+        projection_type: str = "linear",
+        projection_kwargs: Optional[Dict[str, Any]] = None,
         seed: int = 42,
     ):
         super().__init__()
@@ -108,6 +111,9 @@ class PrototypeManager(nn.Module):
         self.distance_metric = distance_metric
         self.trainable_prototypes = bool(trainable_prototypes)
         self.seed = seed
+
+        self.projection_type = projection_type
+        self.projection_kwargs = projection_kwargs or {}
 
         # prototype_indices: (P,)
         # ties each prototype to a training row index (or -1 if synthetic)
@@ -159,15 +165,32 @@ class PrototypeManager(nn.Module):
         )
         self._retrieval_prototypes_param: Optional[nn.Parameter] = None
 
+        # # --- projection head g(·) ---
+        # if self.use_value_space:
+        #     # trainable linear projection
+        #     self.projection_head: nn.Module = nn.Linear(
+        #         self.retrieval_dim,
+        #         self.proj_dim,
+        #         bias=False,
+        #     )
+        #     self._projection_trainable = True
+        # else:
+        #     # identity mapping, no params
+        #     self.projection_head = nn.Identity()
+        #     self._projection_trainable = False
+
         # --- projection head g(·) ---
         if self.use_value_space:
-            # trainable linear projection
-            self.projection_head: nn.Module = nn.Linear(
-                self.retrieval_dim,
-                self.proj_dim,
-                bias=False,
+            # Build customizable projection head
+            self.projection_head = build_projection_head(
+                kind=self.projection_type,
+                input_dim=self.retrieval_dim,
+                output_dim=self.proj_dim,
+                **self.projection_kwargs,
             )
             self._projection_trainable = True
+            # in case user asked for a head whose output_dim differs from proj_dim
+            self.proj_dim = self.projection_head.output_dim
         else:
             # identity mapping, no params
             self.projection_head = nn.Identity()
@@ -274,9 +297,7 @@ class PrototypeManager(nn.Module):
         """
         Map retrieval embeddings -> VALUE space.
 
-        If use_value_space=True, this is a learned Linear.
-        If use_value_space=False, projection_head is Identity() and just
-        returns x unchanged.
+        Now this can be linear, MLP, or RBF-RFF depending on config.
         """
         return self.projection_head(x)
 
@@ -298,19 +319,20 @@ class PrototypeManager(nn.Module):
     # ------------------------------------------------------------------
 
     def enable_projection_training(self, flag: bool) -> None:
-        """
-        Toggle gradient updates for the projection head g(·).
-        Only meaningful if use_value_space=True.
-        """
         if not self.use_value_space:
-            # identity head, nothing to train
             self._projection_trainable = False
             return
 
+        # some heads are non-learnable (e.g. RFF with learnable_rff=False)
+        if hasattr(self.projection_head, "enable_training"):
+            self.projection_head.enable_training(flag)
+        else:
+            # fallback
+            self.projection_head.train(flag)
+            for p in self.projection_head.parameters():
+                p.requires_grad = flag
+
         self._projection_trainable = bool(flag)
-        self.projection_head.train(flag)
-        for p in self.projection_head.parameters():
-            p.requires_grad = flag
 
     def enable_prototype_training(self, flag: bool) -> None:
         """

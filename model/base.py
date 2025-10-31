@@ -45,6 +45,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         # value space / metric learning config
         use_value_space: bool = True,
         proj_dim: Optional[int] = None,
+        projection_type: str = "linear",
+        projection_kwargs: Optional[Dict[str, Any]] = None,
         em_alt_training: bool = False,  # alternate per epoch between geometry vs experts
         # activation / gating config
         gating_strategy: str = "softmax",  # "knn" | "radius" | "softmax" | "mlp_sparse"
@@ -94,6 +96,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
             distance_metric=self.distance_metric,
             trainable_prototypes=trainable_prototypes,
             use_value_space=use_value_space,
+            projection_type=projection_type,
+            projection_kwargs=projection_kwargs,
             seed=self.seed,
         )
 
