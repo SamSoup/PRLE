@@ -11,22 +11,31 @@ def _normalize(x: torch.Tensor) -> torch.Tensor:
 
 
 def _pairwise_distance(
-    x: torch.Tensor,
-    y: torch.Tensor,
-    metric: str = "cosine",
+    x: torch.Tensor, y: torch.Tensor, metric: str = "euclidean"
 ) -> torch.Tensor:
     """
-    Compute retrieval-space distance between each row of x and each row of y.
-    Returns (B,P).
+    x: (B, D)
+    y: (P, D)
+    returns: (B, P)
     """
-    x_n = _normalize(x)
-    y_n = _normalize(y)
+    metric = metric.lower()
+    if metric == "euclidean":
+        # If Lightning/trainer asked for determinism, GPU cdist can error.
+        if torch.are_deterministic_algorithms_enabled() and x.is_cuda:
+            # do deterministic cdist on CPU, then send back
+            x_cpu = x.detach().to("cpu")
+            y_cpu = y.detach().to("cpu")
+            d_cpu = torch.cdist(x_cpu, y_cpu, p=2)
+            return d_cpu.to(x.device)
+        else:
+            return torch.cdist(x, y, p=2)
 
-    if metric == "cosine":
-        # cosine distance = 1 - cos_sim
-        return 1.0 - torch.einsum("bh,ph->bp", x_n, y_n)
-    elif metric == "euclidean":
-        return torch.cdist(x_n, y_n, p=2)
+    elif metric == "cosine":
+        # cosine is easy to make deterministic
+        x_n = F.normalize(x, dim=-1)
+        y_n = F.normalize(y, dim=-1)
+        return 1.0 - torch.matmul(x_n, y_n.t())
+
     else:
         raise ValueError(f"Unknown distance metric: {metric}")
 

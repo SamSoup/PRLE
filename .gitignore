@@ -5,6 +5,7 @@ config/
 inference/test.ipynb
 inference/commands.md
 stsb_prle
+sickr_sts/
 
 data/WMT2020
 data/yelp

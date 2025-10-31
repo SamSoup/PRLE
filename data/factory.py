@@ -1,8 +1,13 @@
+# data/factory.py
+
 from .stsb import STSBDataModule
 from .yelp import Yelp2018DataModule
 from .wmt_enzh import WMT20ENZHDataModule
 from .wmt_roen import WMT20ROENDataModule
 from .wmt_sien import WMT20SIENDataModule
+from .sickr_sts import SICKRSTSDataModule
+from .sts22_crosslingual_sts import STS22CrosslingualSTSDataModule
+from .stsbenchmark_mteb import STSBenchmarkMTEBDataModule
 
 
 def get_datamodule(
@@ -17,15 +22,6 @@ def get_datamodule(
 ):
     """
     Returns an initialized LightningDataModule for the given dataset name.
-
-    Args:
-        dataset_name: e.g. "stsb"
-        model_name: tokenizer/encoder model name (used if tokenizing)
-        max_seq_length: sequence length for tokenization
-        batch_size: train/eval batch size
-        tokenize_inputs: True => tokenize, False => pass raw text/tuples
-        combine_fields: when True, combine (sentence1, sentence2) into one string
-        combine_separator_token: separator when combining, default "[SEP]"
     """
     name = dataset_name.lower()
 
@@ -40,8 +36,44 @@ def get_datamodule(
             combine_separator_token=combine_separator_token,
         )
 
+    if name in {"stsbenchmark-mteb", "stsbenchmark", "stsbench-mteb"}:
+        return STSBenchmarkMTEBDataModule(
+            model_name_or_path=model_name,
+            max_seq_length=max_seq_length,
+            train_batch_size=batch_size,
+            eval_batch_size=batch_size,
+            tokenize_inputs=tokenize_inputs,
+            combine_fields=combine_fields,
+            combine_separator_token=combine_separator_token,
+        )
+
+    if name in {"sickr-sts", "sickr", "sickr_sts"}:
+        return SICKRSTSDataModule(
+            model_name_or_path=model_name,
+            max_seq_length=max_seq_length,
+            train_batch_size=batch_size,
+            eval_batch_size=batch_size,
+            tokenize_inputs=tokenize_inputs,
+            combine_fields=combine_fields,
+            combine_separator_token=combine_separator_token,
+        )
+
+    if name in {
+        "sts22-crosslingual-sts",
+        "sts22-xling-sts",
+        "sts22",
+    }:
+        return STS22CrosslingualSTSDataModule(
+            model_name_or_path=model_name,
+            max_seq_length=max_seq_length,
+            train_batch_size=batch_size,
+            eval_batch_size=batch_size,
+            tokenize_inputs=tokenize_inputs,
+            combine_fields=combine_fields,
+            combine_separator_token=combine_separator_token,
+        )
+
     if name in {"yelp", "yelp2018"}:
-        # Single-field dataset: text + label
         return Yelp2018DataModule(
             model_name_or_path=model_name,
             max_seq_length=max_seq_length,
@@ -83,4 +115,5 @@ def get_datamodule(
             combine_fields=combine_fields,
             combine_separator_token=combine_separator_token,
         )
+
     raise ValueError(f"Unsupported dataset name: {dataset_name}")
