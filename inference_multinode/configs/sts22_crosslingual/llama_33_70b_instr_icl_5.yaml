@@ -1,0 +1,19 @@
+model: meta-llama/Llama-3.3-70B-Instruct
+model_local_dir: /scratch/06782/ysu707/models/llama_33_70b_instr
+backend: ds_zero3
+ds_config_path: inference_multinode/ds_zero3_inference.json
+
+dataset: sts22_crosslingual
+out_dir: /work/06782/ysu707/ls6/PRLE/results/sts22_crosslingual/llama_33_70b_instr/five_shot
+limit: null
+icl_n: 5
+
+max_new_tokens: 10
+temperature: 0.0
+batch_size: 64
+
+dtype: bfloat16
+max_length: 1024
+cache_dir: /scratch/06782/ysu707/prle_cache/hf
+
+heartbeat_every: 5
