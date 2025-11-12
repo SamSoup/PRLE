@@ -1,0 +1,28 @@
+{
+    "bf16": {
+        "enabled": true
+    },
+    "train_batch_size": 1,
+    "train_micro_batch_size_per_gpu": 1,
+    "gradient_accumulation_steps": 1,
+    "zero_optimization": {
+        "stage": 3,
+        "offload_param": {
+            "device": "none"
+        },
+        "offload_optimizer": {
+            "device": "none"
+        },
+        "overlap_comm": true,
+        "reduce_scatter": true,
+        "contiguous_gradients": true,
+        "round_robin_gradients": false
+    },
+    "aio": {
+        "stage3_prefetch_bucket_sz": 0,
+        "stage3_param_persistence_threshold": 0
+    },
+    "flops_profiler": {
+        "enabled": false
+    }
+}
