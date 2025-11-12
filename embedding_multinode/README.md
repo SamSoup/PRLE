@@ -65,25 +65,74 @@ idev -p gh-dev -N 2 -n 2 -t 2:00:00
 
 cd /work/06782/ysu707/ls6/PRLE
 conda activate PRLE
+```
 
-mpirun -np 8 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh embedding_multinode/configs/stsb/llama4_maverick.yaml
+NOTE: use `tail -f $SCRATCH/prle_cache/logs/<job_id>/rank0.log` in a different 
+window to view the running progress bars that do not showup correctly otherwise.
 
-mpirun -np 4 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh embedding_multinode/configs/stsb/qwen3_next_80b_a3b_instr.yaml
+## STSB Commands
 
-mpirun -np 4 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh embedding_multinode/configs/stsb/llama33_70b_instr.yaml
+```
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/stsb/qwen3_next_80b_a3b_instr_train.yaml
 
-mpirun -np 4 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh \
-  embedding_multinode/configs/stsb/qwen3_next_80b_a3b_instr.yaml
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/stsb/qwen3_next_80b_a3b_instr_validation_test.yaml
 
-mpirun -np 2 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh \
-  embedding_multinode/configs/stsb/qwen3_next_80b_a3b_instr.yaml
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/stsb/llama33_70b_instr_train.yaml
 
-mpirun -np 2 --map-by ppr:1:node \
-  bash embedding_multinode/multinode.sh embedding_multinode/configs/stsb/llama33_70b_instr.yaml
+tail -f $SCRATCH/prle_cache/logs/443816/rank0.log
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/stsb/llama33_70b_instr_validation_test.yaml
+
+tail -f $SCRATCH/prle_cache/logs/443891/rank0.log
+```
+
+## Sickr Commands
+
+```
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sickr_sts/qwen3_next_80b_a3b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sickr_sts/qwen3_next_80b_a3b_instr_validation_test.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sickr_sts/llama33_70b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sickr_sts/llama33_70b_instr_validation_test.yaml
+
+```
+
+## Sts crosslingual Commands
+
+```
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sts22_crosslingual_sts/qwen3_next_80b_a3b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sts22_crosslingual_sts/qwen3_next_80b_a3b_instr_validation_test.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sts22_crosslingual_sts/llama33_70b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/sts22_crosslingual_sts/llama33_70b_instr_validation_test.yaml
 
 ```

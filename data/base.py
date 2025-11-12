@@ -118,8 +118,10 @@ class BaseRegressionDataModule(pl.LightningDataModule):
     def _tokenize_splits(self, remove_columns):
         """
         Tokenize using self.text_fields:
-          - If len(self.text_fields) == 1: tokenizes a single string field (e.g., "combined_text")
-          - If len(self.text_fields) == 2: tokenizes a pair (sentence1, sentence2)
+        - If len(self.text_fields) == 1: tokenizes a single string field (e.g., "combined_text")
+        - If len(self.text_fields) == 2: tokenizes a pair (sentence1, sentence2)
+
+        Safe on HPC: single-process map, no Arrow cache reuse, keep results in RAM.
         """
         if not self.tokenize_inputs:
             raise RuntimeError(
@@ -132,20 +134,42 @@ class BaseRegressionDataModule(pl.LightningDataModule):
         if len(self.text_fields) not in (1, 2):
             raise ValueError("self.text_fields must have length 1 or 2.")
 
+        # Ensure we’re in “python” mode before mapping to avoid Arrow formatting pulls
+        for split in self.dataset:
+            self.dataset[split] = self.dataset[split].with_format("python")
+
+        common_map_kwargs = dict(
+            batched=True,
+            batch_size=1024,  # tune if RAM is tight
+            num_proc=1,  # <<< critical: no multiprocessing
+            load_from_cache_file=False,  # <<< do not reuse old Arrow cache
+            keep_in_memory=True,  # <<< build new table fully in RAM
+            desc="Map",
+        )
+
+        # Map safely
+        new_splits = {}
         for split in self.dataset.keys():
             print(f"Processing split: {split}")
-            self.dataset[split] = self.dataset[split].map(
-                self._tokenize, batched=True, remove_columns=remove_columns
+            new_splits[split] = self.dataset[split].map(
+                self._tokenize,
+                remove_columns=remove_columns,
+                **common_map_kwargs,
             )
+            # After mapping, set torch format on the exact columns we’ll read
             self.columns = [
                 c
-                for c in self.dataset[split].column_names
+                for c in new_splits[split].column_names
                 if c in self.loader_columns
             ]
             print(f"Using columns: {self.columns}")
-            self.dataset[split].set_format(type="torch", columns=self.columns)
+            new_splits[split].set_format(
+                type="torch", columns=self.columns, output_all_columns=False
+            )
             if "validation" in split:
                 self.eval_splits.append(split)
+
+        self.dataset = new_splits
 
     def _tokenize(self, example_batch, indices=None):
         # Build batch as either a list[str] or a list[Tuple[str,str]]
@@ -159,13 +183,18 @@ class BaseRegressionDataModule(pl.LightningDataModule):
                 )
             )
 
+        # IMPORTANT: return_tensors=None -> plain Python lists, safe for datasets.map
         features = self.tokenizer.batch_encode_plus(
             texts_or_text_pairs,
-            return_tensors="pt",
+            return_tensors=None,  # <<< was "pt"; change to None
             padding="max_length",
             truncation=True,
             max_length=self.max_seq_length,
         )
-        # Normalize the dataset's label column name -> "labels"
-        features["labels"] = example_batch[self.output_column]
+
+        # Normalize the dataset's label column name -> "labels" (as a list of floats)
+        # example_batch[self.output_column] is already a list; ensure float conversion:
+        labels_list = [float(x) for x in example_batch[self.output_column]]
+        features["labels"] = labels_list
+
         return features

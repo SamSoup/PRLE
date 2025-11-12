@@ -12,16 +12,15 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import sys
 import yaml
+import atexit
+import torch.multiprocessing as mp
+import faulthandler
+import signal
 
-# Backends
-from .big_embeddings_zero3 import (
-    DeepSpeedZero3Embeddings,
-)  # converter-free ZeRO-3 path
-
-# (Optional: keep your previous classes if you want other backends later)
-# from .big_embeddings import DeepSpeedShardedEmbeddings
-# from .big_embeddings_vllm import VLLMRemoteEmbeddings
+# Minimal ZeRO-3 embedder (no monkey patches)
+from .big_embeddings_zero3 import DeepSpeedZero3Embeddings
 
 
 # --------------------------- Config ---------------------------
@@ -44,7 +43,7 @@ class RunConfig:
     splits: Optional[List[str]] = None
     cache_dir: Optional[str] = None
 
-    # Backend selection (we default to ZeRO-3)
+    # Backend (we implement ds_zero3)
     backend: str = "ds_zero3"
 
     # ZeRO-3 specifics (converter-free)
@@ -55,31 +54,57 @@ class RunConfig:
 # --------------------------- Utils ---------------------------
 
 
-def iter_with_progress(loader, desc: str, rank: int):
-    """
-    Iterate over a DataLoader and render a tqdm progress bar on rank 0 only.
-    The bar counts batches (not examples) to stay cheap and robust.
-    """
-    total = len(loader) if hasattr(loader, "__len__") else None
-    pbar = tqdm(
-        total=total,
-        desc=desc,
-        disable=(rank != 0),
-        dynamic_ncols=True,
-        leave=False,
-    )
-    try:
-        for step, batch in enumerate(loader):
-            yield step, batch
-            if rank == 0:
-                pbar.update(1)
-    finally:
-        if rank == 0:
-            pbar.close()
+# put this near the top-level imports (you already have `import os` there)
+def _durable_save_npy(path: str, array: np.ndarray) -> None:
+    with open(path, "wb") as f:
+        np.save(f, array)
+        try:
+            f.flush()
+            os.fsync(f.fileno())
+        except Exception:
+            # fsync may not exist / be needed on some FS
+            pass
 
 
-def _log0(rank: int, msg: str) -> None:
-    if rank == 0:
+class _Tee:
+    """Write everything to both the original stream and a file (line-buffered)."""
+
+    def __init__(self, stream, filepath: str):
+        self._stream = stream
+        # buffering=1 -> line buffered; errors='replace' avoids Unicode crashes
+        self._fp = open(
+            filepath, "a", buffering=1, encoding="utf-8", errors="replace"
+        )
+        atexit.register(self.close)
+
+    def write(self, data):
+        self._stream.write(data)
+        self._fp.write(data)
+        self.flush()
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
+        try:
+            self._fp.flush()
+        except Exception:
+            pass
+
+    def isatty(self):  # tqdm checks this
+        return False
+
+    def close(self):
+        try:
+            self._fp.flush()
+            self._fp.close()
+        except Exception:
+            pass
+
+
+def _rank0_print(msg: str) -> None:
+    if int(os.environ.get("RANK", 0)) == 0:
         print(msg, flush=True)
 
 
@@ -91,7 +116,6 @@ def load_config(path: str) -> RunConfig:
         if k not in raw:
             raise ValueError(f"Missing required config key: '{k}'")
 
-    # Defaults
     raw.setdefault("data_kwargs", {})
     raw.setdefault("dtype", "bfloat16")
     raw.setdefault("max_length", 4096)
@@ -128,21 +152,13 @@ def init_dist() -> tuple[int, int, int]:
         torch.cuda.set_device(local_rank)
 
     if not dist.is_initialized():
-        pg_kwargs = dict(
+        dist.init_process_group(
             backend="nccl" if torch.cuda.is_available() else "gloo",
             timeout=timedelta(minutes=60),
             init_method="env://",
         )
-        # PyTorch >= 2.1 supports device_id in init_process_group
-        if torch.cuda.is_available():
-            try:
-                pg_kwargs["device_id"] = local_rank
-            except TypeError:
-                # older torch: no device_id arg
-                pass
-        dist.init_process_group(**pg_kwargs)
 
-    # Device-aware barrier to avoid NCCL warnings
+    # Device-aware barrier to avoid c10d warnings
     if dist.get_backend() == "nccl" and torch.cuda.is_available():
         dist.barrier(device_ids=[local_rank])
     else:
@@ -166,9 +182,9 @@ def make_loader(dm, split: str, batch_size: int) -> Optional[DataLoader]:
     if split not in dm.dataset:
         return None
     collate = None if getattr(dm, "tokenize_inputs", True) else dm._collate_raw
-    pin_mem = torch.cuda.is_available()
-    # good rule: 2–4 workers per GPU; tune if you have CPU headroom
-    num_workers = 4
+    # pin_mem = torch.cuda.is_available()
+    pin_mem = False
+    num_workers = 0  # load data sequentially on main process
     return DataLoader(
         dm.dataset[split],
         batch_size=batch_size,
@@ -181,90 +197,174 @@ def make_loader(dm, split: str, batch_size: int) -> Optional[DataLoader]:
     )
 
 
+def iter_with_progress(loader, desc: str, rank: int):
+    total = len(loader) if hasattr(loader, "__len__") else None
+    # If RANK0_LOG is set, send tqdm output there; else stderr.
+    log_stream = None
+    if rank == 0 and (fp := os.environ.get("RANK0_LOG")):
+        # Open a separate handle just for tqdm (line-buffered)
+        log_stream = open(
+            fp, "a", buffering=1, encoding="utf-8", errors="replace"
+        )
+    stream = log_stream if log_stream else sys.stderr
+
+    pbar = tqdm(
+        total=total,
+        desc=desc,
+        disable=(rank != 0),
+        dynamic_ncols=False,
+        leave=True,
+        mininterval=0.1,  # update at least every 100ms
+        smoothing=0.1,  # faster EMA
+        file=stream,
+        ascii=True,  # avoid wide/unicode redraws on non-tty pipes
+        position=0,
+        colour=None,  # avoid ANSI if your launcher strips colors
+        ncols=100,
+        bar_format=None,
+        initial=0,
+        unit="it",
+        unit_scale=False,
+        unit_divisor=1000,
+        maxinterval=1.0,  # force periodic refresh under low activity
+    )
+    try:
+        for step, batch in enumerate(loader):
+            yield step, batch
+            if rank == 0:
+                pbar.update(1)
+    finally:
+        if rank == 0:
+            pbar.close()
+            if log_stream:
+                try:
+                    log_stream.flush()
+                    log_stream.close()
+                except Exception:
+                    pass
+
+
 # --------------------------- Main ---------------------------
 
 
 def main() -> None:
+    try:
+        faulthandler.enable(all_threads=True)
+        faulthandler.register(signal.SIGBUS)
+        faulthandler.register(signal.SIGSEGV)
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML config")
     args = ap.parse_args()
 
-    # before main() or early in main()
+    # Avoid fork + /dev/shm usage before any DataLoader is constructed
+    try:
+        mp.set_start_method("spawn", force=True)
+        torch.multiprocessing.set_sharing_strategy("file_system")
+    except RuntimeError:
+        pass
+
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.set_float32_matmul_precision("high")  # PyTorch 2.x
+    torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.benchmark = True
 
     cfg = load_config(args.config)
     rank, world, local_rank = init_dist()
 
-    # Early validation for ZeRO-3 path (no server, no manifest)
-    if cfg.backend.lower() == "ds_zero3":
-        if not cfg.model_local_dir or not os.path.isdir(cfg.model_local_dir):
-            raise FileNotFoundError(
-                f"model_local_dir not found: {cfg.model_local_dir}"
-            )
-        if not cfg.ds_config_path or not os.path.isfile(cfg.ds_config_path):
-            raise FileNotFoundError(
-                f"ds_config_path not found: {cfg.ds_config_path}"
-            )
+    # If we are rank0 and RANK0_LOG is set, tee *all* prints (incl. HF/tqdm) to the file.
+    if rank == 0:
+        log_path = os.environ.get("RANK0_LOG")
+        if log_path:
+            sys.stdout = _Tee(sys.stdout, log_path)
+            sys.stderr = _Tee(sys.stderr, log_path)
 
-    _log0(rank, f"[world={world} local_rank={local_rank}]")
-    _log0(rank, f"Config: {cfg}")
+    # Validate ZeRO-3 path
+    if cfg.backend.lower() != "ds_zero3":
+        raise ValueError(
+            "Only 'ds_zero3' backend is implemented in this minimal overhaul."
+        )
+    if not cfg.model_local_dir or not os.path.isdir(cfg.model_local_dir):
+        raise FileNotFoundError(
+            f"model_local_dir not found: {cfg.model_local_dir}"
+        )
+    if not cfg.ds_config_path or not os.path.isfile(cfg.ds_config_path):
+        raise FileNotFoundError(
+            f"ds_config_path not found: {cfg.ds_config_path}"
+        )
 
-    # Data module
+    _rank0_print(f"[world={world} local_rank={local_rank}]")
+    _rank0_print(f"Config: {cfg}")
+
     dm = load_datamodule(cfg.data_module, cfg.data_kwargs, model_name=cfg.model)
 
-    # Backend selection (we implement ds_zero3 here)
-    backend = cfg.backend.lower()
-    if backend == "ds_zero3":
+    embedder = None
+    try:
         embedder = DeepSpeedZero3Embeddings(
+            model_id=cfg.model,
             model_local_dir=cfg.model_local_dir,  # local HF snapshot
             dtype=cfg.dtype,
-            max_length=cfg.max_length if cfg.max_length > 0 else None,
+            max_length=cfg.max_length if cfg.max_length > 0 else 4096,
             normalize=cfg.normalize,
             pad_to_multiple_of=8,
             trust_remote_code=True,
             ds_config_path=cfg.ds_config_path,
             cache_dir=cfg.cache_dir,
         )
-        encode_mode = (
-            "tokenized" if getattr(dm, "tokenize_inputs", True) else "raw"
-        )
+    except Exception:
+        # propagate error after trying a collective abort
+        if dist.is_initialized():
+            try:
+                dist.barrier()
+            except Exception:
+                pass
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
+        raise
 
-    else:
-        raise ValueError(
-            f"Unknown backend: {cfg.backend}. Expected 'ds_zero3'."
-        )
+    # --- warmup before hitting real data ---
+    if rank == 0:
+        print("[warmup] starting tiny forward...", flush=True)
+    try:
+        warmup_s = embedder.warmup(seq_len=min(256, cfg.max_length))
+        if rank == 0:
+            print(f"[warmup] first forward took {warmup_s:.2f}s", flush=True)
+    except Exception as e:
+        if rank == 0:
+            print(f"[warmup] skipped due to: {e}", flush=True)
 
-    # Splits & output dir
+    encode_mode = "tokenized" if getattr(dm, "tokenize_inputs", True) else "raw"
+
     splits = cfg.splits or ["train", "validation", "test"]
     splits = [s for s in splits if s in dm.dataset]
-    _log0(rank, f"Processing splits: {splits}")
+    _rank0_print(f"Processing splits: {splits}")
     os.makedirs(cfg.out_dir, exist_ok=True)
 
-    # Iterate splits
     for split in splits:
         loader = make_loader(dm, split, cfg.batch_size)
         if loader is None:
-            _log0(rank, f"Skip missing split: {split}")
+            _rank0_print(f"Skip missing split: {split}")
             continue
 
         embs_chunks: List[np.ndarray] = []
         labels_chunks: List[np.ndarray] = []
 
-        with torch.inference_mode():  # cheaper than no_grad
+        with torch.inference_mode():
             for step, batch in iter_with_progress(
                 loader, desc=f"[{split}]", rank=rank
             ):
                 if encode_mode == "tokenized":
+                    # keep it simple: no extra .pin_memory() here (we set pin_memory=False in the loader)
                     token_batch = {
                         k: v
                         for k, v in batch.items()
                         if isinstance(v, torch.Tensor)
                     }
-                    # if you want to overlap H2D copies:
                     token_batch = {
-                        k: v.pin_memory().to("cuda", non_blocking=True)
+                        k: v.to("cuda", non_blocking=True)
                         for k, v in token_batch.items()
                     }
                     vecs = embedder.encode_tokenized(token_batch).cpu().numpy()
@@ -274,45 +374,58 @@ def main() -> None:
                         embedder.embed_documents(list(texts)), dtype=np.float32
                     )
 
-            embs_chunks.append(vecs)
+                embs_chunks.append(vecs)
 
-            if cfg.save_labels and "labels" in batch:
-                labels = batch["labels"]
-                arr = (
-                    labels.detach().cpu().numpy()
-                    if isinstance(labels, torch.Tensor)
-                    else np.asarray(labels)
-                )
-                labels_chunks.append(arr.astype(np.float32))
+                if cfg.save_labels and "labels" in batch:
+                    labels = batch["labels"]
+                    arr = (
+                        labels.detach().cpu().numpy()
+                        if isinstance(labels, torch.Tensor)
+                        else np.asarray(labels)
+                    )
+                    labels_chunks.append(arr.astype(np.float32))
 
-            # occasional textual heartbeat (kept)
-            if rank == 0 and (
-                (step + 1) % max(1, (1000 // cfg.batch_size)) == 0
-            ):
-                _log0(
-                    rank,
-                    f"{split}: processed {(step + 1) * cfg.batch_size} examples",
-                )
+                if rank == 0 and (
+                    (step + 1) % max(1, (1000 // cfg.batch_size)) == 0
+                ):
+                    _rank0_print(
+                        f"{split}: processed {(step + 1) * cfg.batch_size} examples"
+                    )
 
-        # Save (rank 0)
+        # all ranks finished computing this split before any file I/O
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[local_rank])
+        else:
+            dist.barrier()
+
         if rank == 0:
             emb_mat = (
                 np.concatenate(embs_chunks, axis=0)
                 if embs_chunks
                 else np.zeros((0, 0), dtype=np.float32)
             )
-            emb_path = os.path.join(cfg.out_dir, f"embeddings_{split}.npy")
-            np.save(emb_path, emb_mat.astype(np.float32))
-            _log0(rank, f"Wrote {emb_mat.shape} -> {emb_path}")
+            emb_path = os.path.join(cfg.out_dir, f"{split}_embeds.npy")
+            _durable_save_npy(emb_path, emb_mat.astype(np.float32))
+            _rank0_print(f"Wrote {emb_mat.shape} -> {emb_path}")
 
             if cfg.save_labels and labels_chunks:
                 y = np.concatenate(labels_chunks, axis=0)
                 y_path = os.path.join(cfg.out_dir, f"labels_{split}.npy")
-                np.save(y_path, y.astype(np.float32))
-                _log0(rank, f"Wrote labels {y.shape} -> {y_path}")
+                _durable_save_npy(y_path, y.astype(np.float32))
+                _rank0_print(f"Wrote labels {y.shape} -> {y_path}")
 
-    # Clean exit
-    dist.barrier()
+        # ensure rank0 completes writes before anyone tears down NCCL
+        if dist.get_backend() == "nccl" and torch.cuda.is_available():
+            dist.barrier(device_ids=[local_rank])
+        else:
+            dist.barrier()
+    # -------- end replacement block --------
+
+    # Clean exit (keep as you had)
+    if dist.get_backend() == "nccl" and torch.cuda.is_available():
+        dist.barrier(device_ids=[local_rank])
+    else:
+        dist.barrier()
     dist.destroy_process_group()
 
 
