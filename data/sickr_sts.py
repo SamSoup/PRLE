@@ -51,6 +51,7 @@ class SICKRSTSDataModule(BaseRegressionDataModule):
         )
         self.combine_fields = combine_fields
         self.combine_separator_token = combine_separator_token
+        self.label_max = 5.0
 
     def setup(self, stage: str = None):
         # 1) load from our HF repo

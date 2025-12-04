@@ -10,10 +10,11 @@ icl_n: 10
 
 max_new_tokens: 10
 temperature: 0.0
-batch_size: 32
+batch_size: 4
 
 dtype: bfloat16
-max_length: 1024
+max_length: 4096
+
 cache_dir: /scratch/06782/ysu707/prle_cache/hf
 
 heartbeat_every: 5

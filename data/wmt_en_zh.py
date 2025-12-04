@@ -1,14 +1,32 @@
-# /data/wmt2020roen.py
+# data/wmt_en_zh.py
 
 from .base import BaseRegressionDataModule
 import datasets
 
 
-class WMT20ROENDataModule(BaseRegressionDataModule):
+class WMT20ENZHDataModule(BaseRegressionDataModule):
     """
-    WMT20 MLQE Task 1 (ro-en) regression DataModule.
+    samsoup/Samsoup-WMT2020-en-zh DataModule
 
-    Matches the same behaviors as STSBDataModule (see en-zh module).
+    Assumes the HF dataset has columns:
+        - sentence1 (str)
+        - sentence2 (str)
+        - score     (float)
+
+    And splits:
+        - train
+        - validation
+        - test
+
+    Behaves exactly like STSBDataModule / SICKRSTSDataModule:
+      tokenize_inputs=False, combine_fields=True
+        -> raw "text" = "s1 {sep} s2", labels from 'score'
+      tokenize_inputs=False, combine_fields=False
+        -> raw "text" = (s1, s2) tuple, labels from 'score'
+      tokenize_inputs=True,  combine_fields=True
+        -> tokenize single field "combined_text"; labels mapped to 'labels'
+      tokenize_inputs=True,  combine_fields=False
+        -> tokenize pair ("sentence1","sentence2"); labels mapped to 'labels'
     """
 
     def __init__(
@@ -28,68 +46,65 @@ class WMT20ROENDataModule(BaseRegressionDataModule):
             train_batch_size=train_batch_size,
             eval_batch_size=eval_batch_size,
             tokenize_inputs=tokenize_inputs,
-            output_column="mean",
+            output_column="score",
             **kwargs,
         )
         self.combine_fields = combine_fields
         self.combine_separator_token = combine_separator_token
-        self.src_lang = "ro"
-        self.tgt_lang = "en"
+        self.label_max = 100.0
 
-    def setup(self, stage: str = None):
-        self.dataset = datasets.load_dataset("wmt/wmt20_mlqe_task1", "ro-en")
+    def setup(self, stage: str | None = None):
+        # 1) load from our HF repo
+        self.dataset = datasets.load_dataset("samsoup/Samsoup-WMT2020-en-zh")
 
         if self.tokenize_inputs:
+            # TOKENIZED path
             if self.combine_fields:
+                # create single field
                 for split in self.dataset:
                     self.dataset[split] = self.dataset[split].map(
                         lambda x: {
-                            "combined_text": x["translation"][self.src_lang]
+                            "combined_text": x["sentence1"]
                             + f" {self.combine_separator_token} "
-                            + x["translation"][self.tgt_lang],
+                            + x["sentence2"],
                             self.output_column: x[self.output_column],
                         }
                     )
                 self.text_fields = ["combined_text"]
             else:
-                for split in self.dataset:
-                    self.dataset[split] = self.dataset[split].map(
-                        lambda x: {
-                            "source": x["translation"][self.src_lang],
-                            "target": x["translation"][self.tgt_lang],
-                            self.output_column: x[self.output_column],
-                        }
-                    )
-                self.text_fields = ["source", "target"]
+                # standard pair
+                self.text_fields = ["sentence1", "sentence2"]
 
+            # tokenize; base will map score -> labels
             self._tokenize_splits(remove_columns=[self.output_column])
 
         else:
+            # RAW path
             for split in self.dataset:
                 if self.combine_fields:
                     self.dataset[split] = self.dataset[split].map(
                         lambda x: {
-                            "text": x["translation"][self.src_lang]
+                            "text": x["sentence1"]
                             + f" {self.combine_separator_token} "
-                            + x["translation"][self.tgt_lang],
+                            + x["sentence2"],
                             "labels": x[self.output_column],
                         }
                     )
                 else:
                     self.dataset[split] = self.dataset[split].map(
                         lambda x: {
-                            "text": (
-                                x["translation"][self.src_lang],
-                                x["translation"][self.tgt_lang],
-                            ),
+                            "text": (x["sentence1"], x["sentence2"]),
                             "labels": x[self.output_column],
                         }
                     )
 
+            # cast labels to torch
             for split in self.dataset:
                 self.dataset[split].set_format(type=None)
                 self.dataset[split].set_format(
-                    type="torch", columns=["labels"], output_all_columns=True
+                    type="torch",
+                    columns=["labels"],
+                    output_all_columns=True,
                 )
                 if "validation" in split:
                     self.eval_splits.append(split)

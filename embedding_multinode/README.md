@@ -136,3 +136,35 @@ mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
    embedding_multinode/configs/sts22_crosslingual_sts/llama33_70b_instr_validation_test.yaml
 
 ```
+
+
+## WMT Commands
+
+```
+cd /work/06782/ysu707/ls6/PRLE
+conda activate PRLE
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_en_ru/llama33_70b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_en_ru/llama33_70b_instr_validation_test.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_en_zh/llama33_70b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_en_zh/llama33_70b_instr_validation_test.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_si_en/llama33_70b_instr_train.yaml
+
+mpirun -np 2 --map-by ppr:1:node --tag-output --timestamp-output \
+   bash embedding_multinode/multinode.sh \
+   embedding_multinode/configs/wmt_si_en/llama33_70b_instr_validation_test.yaml
+```

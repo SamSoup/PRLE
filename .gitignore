@@ -11,6 +11,13 @@ sts22/
 
 data/WMT2020
 data/yelp
+data/wmt-qe-2022-data/
 
 notes.md
 results.md
+
+wmt_en_ru/
+wmt_en_zh/
+wmt_si_en/
+
+relevant_notes/

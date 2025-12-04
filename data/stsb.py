@@ -35,6 +35,7 @@ class STSBDataModule(BaseRegressionDataModule):
         )
         self.combine_fields = combine_fields
         self.combine_separator_token = combine_separator_token
+        self.label_max = 1.0
 
     def setup(self, stage: str = None):
         # Load the HF dataset again to override

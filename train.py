@@ -81,18 +81,25 @@ def train(config):
             normalize=getattr(config.model, "normalize", False),
         )
 
-    encoder = get_encoder(
-        encoder_type=encoder_type,
-        model_name=config.model.encoder_name,
-        **encoder_kwargs,
-    )
-
+    skip_encoder = getattr(config.model, "skip_loading_encoder", False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if isinstance(encoder, torch.nn.Module):
-        encoder.to(device)
-        encoder.eval()
-        for p in encoder.parameters():
-            p.requires_grad = False  # fully frozen
+    if skip_encoder:
+        encoder = None
+        print(
+            "Skipping Encoder as requested. Please ensure embeddings are already computed in cache dir"
+        )
+    else:
+        encoder = get_encoder(
+            encoder_type=encoder_type,
+            model_name=config.model.encoder_name,
+            **encoder_kwargs,
+        )
+
+        if isinstance(encoder, torch.nn.Module):
+            encoder.to(device)
+            encoder.eval()
+            for p in encoder.parameters():
+                p.requires_grad = False  # fully frozen
 
     # -------------------------------------------------
     # 3. Create the EmbeddingDataModule
@@ -284,7 +291,9 @@ def train(config):
         projection_kwargs=getattr(config.model, "projection_kwargs", None),
     )
 
-    ckpt_obj = torch.load(best_model_path, map_location="cpu")
+    ckpt_obj = torch.load(
+        best_model_path, map_location="cpu", weights_only=False
+    )
     state_dict = ckpt_obj["state_dict"]
 
     pm = best_model.prototype_manager

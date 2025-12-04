@@ -1,24 +1,32 @@
-# data/sts22_crosslingual_sts.py
+# data/wmt_roen.py
 
 from .base import BaseRegressionDataModule
 import datasets
 
 
-class STS22CrosslingualSTSDataModule(BaseRegressionDataModule):
+class WMT20RUENDataModule(BaseRegressionDataModule):
     """
-    samsoup/sts22-crosslingual-sts DataModule
+    samsoup/Samsoup-WMT2020-ru-en (or ro-en) DataModule
 
-    Assumes columns:
-        - sentence1
-        - sentence2
-        - score
+    Assumes the HF dataset has columns:
+        - sentence1 (str)
+        - sentence2 (str)
+        - score     (float)
 
-    And splits (as we pushed them):
+    And splits:
         - train
-        - validation   (30% of original train)
-        - test         (original test, normalized)
+        - validation
+        - test
 
-    Same behavior/options as STSBDataModule.
+    Behaves exactly like STSBDataModule / SICKRSTSDataModule:
+      tokenize_inputs=False, combine_fields=True
+        -> raw "text" = "s1 {sep} s2", labels from 'score'
+      tokenize_inputs=False, combine_fields=False
+        -> raw "text" = (s1, s2) tuple, labels from 'score'
+      tokenize_inputs=True,  combine_fields=True
+        -> tokenize single field "combined_text"; labels mapped to 'labels'
+      tokenize_inputs=True,  combine_fields=False
+        -> tokenize pair ("sentence1","sentence2"); labels mapped to 'labels'
     """
 
     def __init__(
@@ -43,14 +51,16 @@ class STS22CrosslingualSTSDataModule(BaseRegressionDataModule):
         )
         self.combine_fields = combine_fields
         self.combine_separator_token = combine_separator_token
-        self.label_max = 4.0
+        self.label_max = 100.0
 
-    def setup(self, stage: str = None):
+    def setup(self, stage: str | None = None):
         # 1) load from our HF repo
-        self.dataset = datasets.load_dataset("Samsoup/sts22-crosslingual-sts")
+        self.dataset = datasets.load_dataset("samsoup/Samsoup-WMT2020-ru-en")
 
         if self.tokenize_inputs:
+            # TOKENIZED path
             if self.combine_fields:
+                # create single field
                 for split in self.dataset:
                     self.dataset[split] = self.dataset[split].map(
                         lambda x: {
@@ -62,11 +72,14 @@ class STS22CrosslingualSTSDataModule(BaseRegressionDataModule):
                     )
                 self.text_fields = ["combined_text"]
             else:
+                # standard pair
                 self.text_fields = ["sentence1", "sentence2"]
 
+            # tokenize; base will map score -> labels
             self._tokenize_splits(remove_columns=[self.output_column])
 
         else:
+            # RAW path
             for split in self.dataset:
                 if self.combine_fields:
                     self.dataset[split] = self.dataset[split].map(
@@ -85,10 +98,13 @@ class STS22CrosslingualSTSDataModule(BaseRegressionDataModule):
                         }
                     )
 
+            # cast labels to torch
             for split in self.dataset:
                 self.dataset[split].set_format(type=None)
                 self.dataset[split].set_format(
-                    type="torch", columns=["labels"], output_all_columns=True
+                    type="torch",
+                    columns=["labels"],
+                    output_all_columns=True,
                 )
                 if "validation" in split:
                     self.eval_splits.append(split)

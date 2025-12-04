@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchmetrics.functional as tmf
+import torchmetrics
 
 from model.prototypes import PrototypeManager, build_prototype_manager
 from model.activations import build_activation_router
@@ -451,20 +452,81 @@ class BasePrototypicalRegressor(pl.LightningModule):
     # Logging helpers
     # ------------------------------------------------------------
 
+    # ------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------
+
+    # ------------------------------------------------------------
+    # Logging helpers
+    # ------------------------------------------------------------
+
     def _log_epoch_metrics(
         self,
         preds_list: List[torch.Tensor],
         labels_list: List[torch.Tensor],
         prefix: str,
     ) -> None:
+        """
+        Aggregate predictions/labels over an epoch and log metrics.
+
+        Metrics on the RAW label scale:
+          - mse, rmse
+          - pearson, spearman, kendall
+
+        If a label_max is available (self.label_max or dm.label_max), we also
+        compute the same metrics on [0,1]-normalized scores.
+        """
         if not preds_list:
             return
-        preds = torch.cat(preds_list)
-        labels = torch.cat(labels_list)
-        mse = tmf.mean_squared_error(preds, labels)
-        rho = tmf.pearson_corrcoef(preds, labels)
-        self.log(f"{prefix}_mse", mse, prog_bar=True)
-        self.log(f"{prefix}_corr", rho, prog_bar=True)
+
+        preds = torch.cat(preds_list).to(self.device)
+        labels = torch.cat(labels_list).to(self.device)
+
+        # ---- RAW SCALE METRICS ----
+        mse_raw = tmf.mean_squared_error(preds, labels)
+        rmse_raw = torch.sqrt(mse_raw)
+        pearson_raw = tmf.pearson_corrcoef(preds, labels)
+        spearman_raw = tmf.spearman_corrcoef(preds, labels)
+
+        # Kendall's tau via the metric class (not functional)
+        kendall_metric = torchmetrics.KendallRankCorrCoef().to(self.device)
+        kendall_raw = kendall_metric(preds, labels)
+
+        self.log(f"{prefix}_mse", mse_raw, prog_bar=True)
+        self.log(f"{prefix}_rmse", rmse_raw, prog_bar=False)
+        self.log(f"{prefix}_pearson", pearson_raw, prog_bar=True)
+        self.log(f"{prefix}_spearman", spearman_raw, prog_bar=False)
+        self.log(f"{prefix}_kendall", kendall_raw, prog_bar=False)
+
+        # ---- NORMALIZED METRICS (OPTIONAL) ----
+        # If you want 0–1 metrics, set label_max somewhere:
+        #   - self.label_max in your model subclass, or
+        #   - dm.label_max in your DataModule
+        label_max = None
+        if hasattr(self, "label_max") and self.label_max is not None:
+            label_max = float(self.label_max)
+        elif self.dm is not None and hasattr(self.dm, "label_max"):
+            label_max = float(self.dm.label_max)
+
+        if label_max is not None and label_max > 0:
+            preds_norm = preds / label_max
+            labels_norm = labels / label_max
+
+            mse_norm = tmf.mean_squared_error(preds_norm, labels_norm)
+            rmse_norm = torch.sqrt(mse_norm)
+            pearson_norm = tmf.pearson_corrcoef(preds_norm, labels_norm)
+            spearman_norm = tmf.spearman_corrcoef(preds_norm, labels_norm)
+
+            kendall_norm_metric = torchmetrics.KendallRankCorrCoef().to(
+                self.device
+            )
+            kendall_norm = kendall_norm_metric(preds_norm, labels_norm)
+
+            self.log(f"{prefix}_mse_norm", mse_norm, prog_bar=False)
+            self.log(f"{prefix}_rmse_norm", rmse_norm, prog_bar=False)
+            self.log(f"{prefix}_pearson_norm", pearson_norm, prog_bar=False)
+            self.log(f"{prefix}_spearman_norm", spearman_norm, prog_bar=False)
+            self.log(f"{prefix}_kendall_norm", kendall_norm, prog_bar=False)
 
     # ------------------------------------------------------------
     # Lightning plumbing

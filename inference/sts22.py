@@ -14,6 +14,7 @@
 #   - Labels are in [1,4].
 #   - We now report metrics on BOTH raw 1..4 and normalized 0..1 via (x-1)/3.
 
+import time
 import argparse
 import os
 import json
@@ -22,10 +23,8 @@ import requests
 import numpy as np
 import random
 from datasets import load_dataset
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr, kendalltau
 from tqdm.auto import tqdm
-
-API_URL = "https://tejas.tacc.utexas.edu/v1/60709c21-409c-44a5-8a9d-1638fad5d5a6/chat/completions"
 
 SYSTEM_MSG = (
     "You are an expert annotator for semantic textual similarity (STS) on multilingual sentence pairs.\n"
@@ -63,7 +62,15 @@ def build_user_message(test_s1, test_s2, icl_examples):
 
 
 def query_similarity_llm(
-    sentence_a, sentence_b, api_key, model_name, icl_examples, timeout=60
+    api_base_url,
+    sentence_a,
+    sentence_b,
+    api_key,
+    model_name,
+    icl_examples,
+    timeout=60,
+    max_retries=2,
+    backoff_seconds=60,
 ):
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -79,13 +86,55 @@ def query_similarity_llm(
         "max_tokens": 10,
         "temperature": 0.0,
     }
-    resp = requests.post(
-        API_URL, headers=headers, json=payload, timeout=timeout
-    )
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"LLM request failed: {resp.status_code} {resp.text}"
-        )
+
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            resp = requests.post(
+                f"{api_base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=timeout,
+            )
+        except Exception as e:
+            # Network or other request error
+            last_error = e
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"LLM request failed after {max_retries} attempts: {e}"
+                )
+            print(
+                f"Request error (attempt {attempt}/{max_retries}): {e}. "
+                f"Sleeping {backoff_seconds} seconds before retry."
+            )
+            time.sleep(backoff_seconds)
+            continue
+
+        # If successful, break out of retry loop
+        if resp.status_code == 200:
+            break
+
+        # Retry on rate limit or server errors
+        if resp.status_code == 429 or 500 <= resp.status_code < 600:
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"LLM request failed after {max_retries} attempts: "
+                    f"{resp.status_code} {resp.text}"
+                )
+            print(
+                f"LLM request failed with status {resp.status_code} "
+                f"(attempt {attempt}/{max_retries}). "
+                f"Sleeping {backoff_seconds} seconds before retry."
+            )
+            time.sleep(backoff_seconds)
+            continue
+        else:
+            # For other HTTP errors (e.g. 400 / 401), don't retry
+            raise RuntimeError(
+                f"LLM request failed: {resp.status_code} {resp.text}"
+            )
+
+    # At this point, resp.status_code == 200
     data = resp.json()
     raw_answer = None
     try:
@@ -131,7 +180,7 @@ def sample_icl_examples(train_split, n):
     return examples
 
 
-def run_eval(api_key, model_name, out_dir, limit, icl_n, seed):
+def run_eval(api_base_url, api_key, model_name, out_dir, limit, icl_n, seed):
     os.makedirs(out_dir, exist_ok=True)
     random.seed(seed)
 
@@ -157,6 +206,7 @@ def run_eval(api_key, model_name, out_dir, limit, icl_n, seed):
 
         try:
             pred_raw, raw_answer, _ = query_similarity_llm(
+                api_base_url,
                 s1,
                 s2,
                 api_key=api_key,
@@ -196,30 +246,54 @@ def run_eval(api_key, model_name, out_dir, limit, icl_n, seed):
     pred_scores_norm = np.array(pred_scores_norm, dtype=float)
 
     # raw metrics
-    pearson_raw, _ = pearsonr(pred_scores_raw, gold_scores_raw)
     mse_raw = mse(pred_scores_raw, gold_scores_raw)
+    rmse_raw = float(np.sqrt(mse_raw))
+    pearson_raw, _ = pearsonr(pred_scores_raw, gold_scores_raw)
+    spearman_raw, _ = spearmanr(pred_scores_raw, gold_scores_raw)
+    kendall_raw, _ = kendalltau(pred_scores_raw, gold_scores_raw)
 
     # normalized metrics
-    pearson_norm, _ = pearsonr(pred_scores_norm, gold_scores_norm)
     mse_norm = mse(pred_scores_norm, gold_scores_norm)
+    rmse_norm = float(np.sqrt(mse_norm))
+    pearson_norm, _ = pearsonr(pred_scores_norm, gold_scores_norm)
+    spearman_norm, _ = spearmanr(pred_scores_norm, gold_scores_norm)
+    kendall_norm, _ = kendalltau(pred_scores_norm, gold_scores_norm)
 
     metrics = {
         "num_pairs_scored": int(len(pred_scores_raw)),
-        "pearson_correlation_raw": float(pearson_raw),
-        "mse_raw": float(mse_raw),
-        "pearson_correlation_norm": float(pearson_norm),
-        "mse_norm": float(mse_norm),
         "model_name": model_name,
         "icl_n": int(len(icl_examples)),
         "label_range": "1..4 (also reported normalized to 0..1 via (x-1)/3)",
+        "raw": {
+            "mse": float(mse_raw),
+            "rmse": float(rmse_raw),
+            "pearson_correlation": float(pearson_raw),
+            "spearman_correlation": float(spearman_raw),
+            "kendall_correlation": float(kendall_raw),
+        },
+        "normalized_0_1": {
+            "mse": float(mse_norm),
+            "rmse": float(rmse_norm),
+            "pearson_correlation": float(pearson_norm),
+            "spearman_correlation": float(spearman_norm),
+            "kendall_correlation": float(kendall_norm),
+        },
     }
 
     print("=======================================")
     print(f"Pairs evaluated: {metrics['num_pairs_scored']}")
-    print(f"RAW 1..4     → Pearson: {metrics['pearson_correlation_raw']:.4f}")
-    print(f"RAW 1..4     → MSE:     {metrics['mse_raw']:.6f}")
-    print(f"NORMALIZED   → Pearson: {metrics['pearson_correlation_norm']:.4f}")
-    print(f"NORMALIZED   → MSE:     {metrics['mse_norm']:.6f}")
+    print("--- RAW 1..4 scale ---")
+    print(f"Pearson: {metrics['raw']['pearson_correlation']:.4f}")
+    print(f"Spearman: {metrics['raw']['spearman_correlation']:.4f}")
+    print(f"Kendall τ: {metrics['raw']['kendall_correlation']:.4f}")
+    print(f"MSE:  {metrics['raw']['mse']:.6f}")
+    print(f"RMSE: {metrics['raw']['rmse']:.6f}")
+    print("--- Normalized 0..1 scale ---")
+    print(f"Pearson: {metrics['normalized_0_1']['pearson_correlation']:.4f}")
+    print(f"Spearman: {metrics['normalized_0_1']['spearman_correlation']:.4f}")
+    print(f"Kendall τ: {metrics['normalized_0_1']['kendall_correlation']:.4f}")
+    print(f"MSE:  {metrics['normalized_0_1']['mse']:.6f}")
+    print(f"RMSE: {metrics['normalized_0_1']['rmse']:.6f}")
     print(f"In-context examples used: {metrics['icl_n']}")
 
     preds_path = os.path.join(out_dir, "predictions.csv")
@@ -266,6 +340,7 @@ def parse_args():
     p = argparse.ArgumentParser(
         description="Evaluate LLM similarity on Samsoup/sts22-crosslingual-sts (1..4 labels; multilingual pairs)."
     )
+    p.add_argument("--api_base_url", type=str, required=True)
     p.add_argument("--api_key", type=str, required=True)
     p.add_argument("--model_name", type=str, required=True)
     p.add_argument("--out_dir", type=str, required=True)
@@ -278,6 +353,7 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     run_eval(
+        args.api_base_url,
         args.api_key,
         args.model_name,
         args.out_dir,

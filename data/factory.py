@@ -2,12 +2,12 @@
 
 from .stsb import STSBDataModule
 from .yelp import Yelp2018DataModule
-from .wmt_enzh import WMT20ENZHDataModule
-from .wmt_roen import WMT20ROENDataModule
-from .wmt_sien import WMT20SIENDataModule
 from .sickr_sts import SICKRSTSDataModule
 from .sts22_crosslingual_sts import STS22CrosslingualSTSDataModule
 from .stsbenchmark_mteb import STSBenchmarkMTEBDataModule
+from .wmt_en_zh import WMT20ENZHDataModule
+from .wmt_en_ru import WMT20RUENDataModule
+from .wmt_si_en import WMT20SIENDataModule
 
 
 def get_datamodule(
@@ -83,7 +83,7 @@ def get_datamodule(
         )
 
     # ---- WMT20 MLQE Task 1 variants ----
-    if name in {"wmt20-enzh", "wmt2020-enzh", "mlqe-enzh"}:
+    if name in {"wmt20-enzh", "wmt20-en-zh", "wmt20-zhen", "wmt20-zh-en"}:
         return WMT20ENZHDataModule(
             model_name_or_path=model_name,
             max_seq_length=max_seq_length,
@@ -94,8 +94,8 @@ def get_datamodule(
             combine_separator_token=combine_separator_token,
         )
 
-    if name in {"wmt20-roen", "wmt2020-roen", "mlqe-roen"}:
-        return WMT20ROENDataModule(
+    if name in {"wmt20-ruen", "wmt20-ru-en", "wmt20-enru", "wmt20-en-ru"}:
+        return WMT20RUENDataModule(
             model_name_or_path=model_name,
             max_seq_length=max_seq_length,
             train_batch_size=batch_size,
@@ -105,7 +105,12 @@ def get_datamodule(
             combine_separator_token=combine_separator_token,
         )
 
-    if name in {"wmt20-sien", "wmt2020-sien", "mlqe-sien"}:
+    if name in {
+        "wmt20-sien",
+        "wmt20-si-en",
+        "wmt20-ensi",
+        "wmt20-en-en",
+    }:
         return WMT20SIENDataModule(
             model_name_or_path=model_name,
             max_seq_length=max_seq_length,

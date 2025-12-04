@@ -91,8 +91,28 @@ class InferenceModule:
 
 
 def parse_reply_to_0_1(raw: str) -> float:
-    # Expect 1..5 with up to 3 decimals → normalize to [0,1]
-    m = re.search(r"\b\d+(?:\.\d+)?\b", raw.strip())
-    v = 3.0 if not m else float(m.group(0))
+    """
+    Expect a score in 1..5 (inclusive) with up to 3 decimals somewhere in the text.
+    Be robust to prompt-echo like '...decimal:assistant\\n\\n2.4' and ranges like '1..5'.
+    Strategy: take the last valid numeric token in [1,5], then normalize to [0,1].
+    """
+    s = raw.strip()
+
+    # Find numeric tokens like 2, 2.4, 2.45, 2.456, .5, .75, .123 (limit to ≤3 decimals).
+    tokens = re.findall(r"(?<!\d)(?:\d+(?:\.\d{1,3})?|\.\d{1,3})(?!\d)", s)
+
+    v = None
+    for t in reversed(tokens):
+        try:
+            x = float(t)
+        except ValueError:
+            continue
+        if 1.0 <= x <= 5.0:
+            v = x
+            break
+
+    if v is None:
+        v = 3.0  # neutral fallback
+
     v = max(1.0, min(5.0, v))
     return float((v - 1.0) / 4.0)
