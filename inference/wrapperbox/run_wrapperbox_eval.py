@@ -337,9 +337,23 @@ def main():
         return KNeighborsRegressor()
 
     knn_param_grid = {
-        "regressor__n_neighbors": [3, 5, 10, 20],
+        "regressor__n_neighbors": [
+            3,
+            5,
+            7,
+            9,
+            11,
+            20,
+            50,
+            75,
+            100,
+            200,
+            500,
+            1000,
+        ],
         "regressor__weights": ["uniform", "distance"],
         "regressor__p": [1, 2],  # L1 or L2
+        "regressor__metric": ["euclidean", "cosine"],
     }
 
     knn_best_estimator, knn_best_params, knn_best_val_mse = (

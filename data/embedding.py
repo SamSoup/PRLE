@@ -26,6 +26,10 @@ class _EmbeddingTensorDataset(Dataset):
         assert embeddings.shape[0] == labels.shape[0]
         self.embeddings = embeddings  # (N,H) float32 CPU or GPU agnostic
         self.labels = labels  # (N,)   float32
+        # Keep track of original row indices so downstream models can know
+        # which training example each batch element came from (needed for
+        # anchor-routing in PRLE v2).
+        self.indices = torch.arange(labels.shape[0], dtype=torch.long)
 
     def __len__(self):
         return self.labels.shape[0]
@@ -33,7 +37,8 @@ class _EmbeddingTensorDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         return {
             "embeddings": self.embeddings[idx],  # (H,)
-            "labels": self.labels[idx],  # ()
+            "labels": self.labels[idx],  # (1)
+            "indices": self.indices[idx],  # (1)
         }
 
 

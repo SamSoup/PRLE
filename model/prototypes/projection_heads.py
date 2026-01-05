@@ -11,7 +11,8 @@ import torch.nn.functional as F
 ProjectionKind = Literal[
     "linear",  # plain nn.Linear (your current behavior)
     "mlp",  # small MLP, still learnable
-    "rbf_rff",  # random Fourier features → RBF-ish map
+    "rbf_rff",  # random Fourier features → RBF-ish map,
+    "resmlp",  # residual MLP kernel (v2 default)
 ]
 
 
@@ -84,7 +85,7 @@ class RBFRandomFourierProjectionHead(BaseProjectionHead):
     """
     Approximates an RBF kernel feature map using Random Fourier Features:
 
-        phi(x) = sqrt(2/D) * [cos(xW + b), sin(xW + b)]
+        phi(x) = sqrt(2/D) * [cos(xW  b), sin(xW  b)]
 
     where:
       - W ~ N(0, 1/sigma^2)
@@ -111,7 +112,7 @@ class RBFRandomFourierProjectionHead(BaseProjectionHead):
             learnable_rff: if True, W and b are nn.Parameters
         """
         super().__init__()
-        # we build W for half-dim, then concat cos+sin
+        # we build W for half-dim, then concat cossin
         half_dim = out_dim // 2
         self.in_dim = in_dim
         self.out_dim_final = 2 * half_dim
@@ -152,6 +153,65 @@ class RBFRandomFourierProjectionHead(BaseProjectionHead):
         super().enable_training(flag)
 
 
+class ResMLPProjectionHead(BaseProjectionHead):
+    """
+    Slightly higher-capacity projection head:
+      - stack of Linear  nonlinearity ( dropout)
+      - optional residual connection if input/output dims match
+      - final LayerNorm for stability
+
+    This is meant to mimic the kind of "kernel" head used in modern
+    sentence-transformer finetuning, but still relatively cheap.
+    """
+
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        hidden_dim: Optional[int] = None,
+        num_layers: int = 2,
+        dropout: float = 0.0,
+        activation: str = "relu",
+    ):
+        super().__init__()
+        hidden_dim = hidden_dim or out_dim
+
+        layers = []
+        last_dim = in_dim
+        act_cls = nn.ReLU if activation.lower() == "relu" else nn.GELU
+
+        for _ in range(num_layers):
+            layers.append(nn.Linear(last_dim, hidden_dim))
+            layers.append(act_cls())
+            if dropout > 0.0:
+                layers.append(nn.Dropout(dropout))
+            last_dim = hidden_dim
+
+        self.net = nn.Sequential(*layers)
+        self.out_proj = (
+            nn.Linear(hidden_dim, out_dim)
+            if hidden_dim != out_dim
+            else nn.Identity()
+        )
+        self._out_dim = out_dim
+        self.norm = nn.LayerNorm(out_dim)
+
+        self._in_dim = in_dim
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.net(x)
+        h = self.out_proj(h)
+        # simple residual when dimensions match
+        if x.shape[-1] == h.shape[-1]:
+            h = h + x
+        h = self.norm(h)
+        return h
+
+    @property
+    def output_dim(self) -> int:
+        return self._out_dim
+
+
 def build_projection_head(
     kind: ProjectionKind,
     input_dim: int,
@@ -176,6 +236,21 @@ def build_projection_head(
             hidden_dim=hidden,
             num_layers=num_layers,
             activation=act,
+        )
+
+    if kind == "resmlp":
+        out = output_dim or input_dim
+        hidden = kwargs.get("hidden_dim", None)
+        num_layers = kwargs.get("num_layers", 2)
+        dropout = kwargs.get("dropout", 0.0)
+        activation = kwargs.get("activation", "relu")
+        return ResMLPProjectionHead(
+            in_dim=input_dim,
+            out_dim=out,
+            hidden_dim=hidden,
+            num_layers=num_layers,
+            dropout=dropout,
+            activation=activation,
         )
 
     if kind in {"rbf", "rbf_rff"}:

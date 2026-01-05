@@ -1,5 +1,3 @@
-# model/base.py
-
 from typing import Optional, Dict, Any, Tuple, List
 import os
 
@@ -16,18 +14,29 @@ from model.activations import build_activation_router
 
 class BasePrototypicalRegressor(pl.LightningModule):
     """
-    PRLE base class.
+    PRLE base class with two regimes:
 
-    Pieces:
-      - PrototypeManager: prototypes + projection head + metric learning.
-      - ActivationRouter: routing / gating logic.
-      - Subclass (LinearExpertPRLE, etc.): per-prototype experts.
+      - v1 (use_v2_loss == False):
+          * Prototypes initialized / reasoned about in retrieval space.
+          * Router primarily uses retrieval-space distances
+            (with optional value-space info for MLP router).
+          * Multi-term loss:
+                task + metric + proto_self + local + consistency
+          * Optional EM-style geometry vs experts alternation.
 
-    Responsibilities:
-      - forward() composition
-      - multi-term loss (task, metric, proto_self, local, consistency)
-      - EM-style alternation control
-      - logging / metrics
+      - v2 (use_v2_loss == True):
+          * Value space is pre-trained by a separate kernel stage.
+          * Prototypes are selected in VALUE space (k-medoids / kmeans++ etc.),
+            but still correspond to concrete training examples.
+          * Router operates purely in VALUE space (KNN/softmax/radius/MLP).
+          * Loss is MoE-style:
+                task_main + expert_fit + anchor_route + balance + entropy
+          * Geometry is frozen; only experts + router train.
+
+    Subclasses define the expert family by implementing:
+        _init_experts_hook
+        _enable_expert_training
+        _expert_outputs
     """
 
     def __init__(
@@ -48,14 +57,14 @@ class BasePrototypicalRegressor(pl.LightningModule):
         proj_dim: Optional[int] = None,
         projection_type: str = "linear",
         projection_kwargs: Optional[Dict[str, Any]] = None,
-        em_alt_training: bool = False,  # alternate per epoch between geometry vs experts
+        em_alt_training: bool = False,  # v1-only: alternate per epoch
         # activation / gating config
         gating_strategy: str = "softmax",  # "knn" | "radius" | "softmax" | "mlp_sparse"
         knn_k: int = 3,
         radius_threshold: float = 0.5,
         activation_mlp_hidden_dim: int = 64,
         expert_mlp_hidden_dim: int = 64,
-        # loss weighting per phase
+        # loss weighting per phase (v1)
         lambda_task_geom: float = 1.0,
         lambda_task_expert: float = 1.0,
         lambda_metric_geom: float = 1.0,
@@ -66,6 +75,13 @@ class BasePrototypicalRegressor(pl.LightningModule):
         lambda_local_expert: float = 1.0,
         lambda_consistency_geom: float = 1.0,
         lambda_consistency_expert: float = 1.0,
+        # -------- PRLE v2 loss config --------
+        use_v2_loss: bool = False,
+        lambda_task_main: float = 1.0,
+        lambda_expert_fit: float = 0.5,
+        lambda_anchor_route: float = 0.5,
+        lambda_balance: float = 0.1,
+        lambda_entropy: float = 0.0,
     ):
         super().__init__()
         self.expert_mlp_hidden_dim = int(expert_mlp_hidden_dim)
@@ -120,7 +136,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self._init_experts_hook()
 
         # -------------------
-        # EM alternation config
+        # EM alternation config (v1)
         # -------------------
         self.em_alt_training = bool(em_alt_training)
         # possible stages: "geometry", "experts", "all_unfrozen"
@@ -129,7 +145,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         )
 
         # -------------------
-        # Phase-weighted loss lambdas
+        # Phase-weighted loss lambdas (v1)
         # -------------------
         self.lambda_task_geom = lambda_task_geom
         self.lambda_task_expert = lambda_task_expert
@@ -147,6 +163,16 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self.lambda_consistency_expert = lambda_consistency_expert
 
         # -------------------
+        # v2 loss config
+        # -------------------
+        self.use_v2_loss = bool(use_v2_loss)
+        self.lambda_task_main = float(lambda_task_main)
+        self.lambda_expert_fit = float(lambda_expert_fit)
+        self.lambda_anchor_route = float(lambda_anchor_route)
+        self.lambda_balance = float(lambda_balance)
+        self.lambda_entropy = float(lambda_entropy)
+
+        # -------------------
         # buffers for eval logging
         # -------------------
         self._val_preds: List[torch.Tensor] = []
@@ -155,7 +181,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self._test_labels: List[torch.Tensor] = []
 
         self.output_dir = output_dir
-        os.makedirs(self.output_dir, exist_ok=True)
+        if self.output_dir is not None:
+            os.makedirs(self.output_dir, exist_ok=True)
 
     # ------------------------------------------------------------
     # Hooks subclasses must implement
@@ -186,44 +213,33 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self.activation_router.enable_training(flag)
 
     # ------------------------------------------------------------
-    # Forward internals
+    # Forward internals (v1 vs v2)
     # ------------------------------------------------------------
 
-    def _forward_internals(
+    def _forward_internals_v1(
         self,
         retrieval_embeds: torch.Tensor,  # (B,H_retrieval)
     ) -> Dict[str, torch.Tensor]:
         """
-        Produce predictions + intermediates for losses.
-
-        Returns:
-            retrieval_protos: (P,H)
-            value_protos:     (P,Dv)
-            value_embeds:     (B,Dv)
-            weights:          (B,P)
-            expert_matrix:    (B,P) or (B,P,1)
-            preds:            (B,)
+        v1 pipeline:
+          - Prototypes in retrieval space.
+          - Router distances in retrieval space.
+          - Experts consume value-space embeddings.
         """
-        self._ensure_prototypes_ready()
-
         batch_device = retrieval_embeds.device
 
-        # Get prototypes on SAME DEVICE as the batch.
+        # Prototypes (retrieval + value)
         retrieval_protos = self.prototype_manager.get_retrieval_prototypes(
             device=batch_device
         )  # (P,H)
-
-        # Project embeddings to value space
         value_embeds = self.prototype_manager.project_embeddings(
             retrieval_embeds
         )  # (B,Dv)
-
-        # Project prototype embeddings to value space
         value_protos = self.prototype_manager.get_value_prototypes(
             device=batch_device
         )  # (P,Dv)
 
-        # Router/gating: weights over prototypes
+        # Router in retrieval space (legacy behavior for KNN/softmax/radius)
         weights = self.activation_router(
             retrieval_embeds=retrieval_embeds,
             retrieval_protos=retrieval_protos,
@@ -231,13 +247,10 @@ class BasePrototypicalRegressor(pl.LightningModule):
             value_protos=value_protos,
         )  # (B,P)
 
-        # Experts: per-proto prediction for each example
+        # Experts run in value space
         expert_matrix = self._expert_outputs(value_embeds)  # (B,P) or (B,P,1)
 
-        # Final scalar prediction
-        preds = self._aggregate_expert_predictions(
-            expert_matrix, weights
-        )  # (B,)
+        preds = self._aggregate_expert_predictions(expert_matrix, weights)
 
         return {
             "retrieval_protos": retrieval_protos,
@@ -247,6 +260,68 @@ class BasePrototypicalRegressor(pl.LightningModule):
             "expert_matrix": expert_matrix,
             "preds": preds,
         }
+
+    def _forward_internals_v2(
+        self,
+        retrieval_embeds: torch.Tensor,  # (B,H_retrieval)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        v2 pipeline:
+          - Value space is the primary geometry.
+          - Prototypes are chosen in value space (at init time).
+          - Router operates entirely in value space:
+                distances(value_embeds, value_protos)
+          - Experts consume value-space embeddings.
+        """
+        batch_device = retrieval_embeds.device
+
+        # Still expose retrieval_protos (for interpretability/debugging),
+        # but routing itself ignores them.
+        retrieval_protos = self.prototype_manager.get_retrieval_prototypes(
+            device=batch_device
+        )  # (P,H)
+
+        # Project batch + prototypes to value space
+        value_embeds = self.prototype_manager.project_embeddings(
+            retrieval_embeds
+        )  # (B,Dv)
+        value_protos = self.prototype_manager.get_value_prototypes(
+            device=batch_device
+        )  # (P,Dv)
+
+        # Router DISPATCH: pass value-space tensors also as "retrieval_*"
+        # so that KNN/Softmax/Radius routers now operate in value space.
+        weights = self.activation_router(
+            retrieval_embeds=value_embeds,  # <- value space
+            retrieval_protos=value_protos,  # <- value space
+            value_embeds=value_embeds,
+            value_protos=value_protos,
+        )  # (B,P)
+
+        expert_matrix = self._expert_outputs(value_embeds)  # (B,P) or (B,P,1)
+        preds = self._aggregate_expert_predictions(expert_matrix, weights)
+
+        return {
+            "retrieval_protos": retrieval_protos,
+            "value_protos": value_protos,
+            "value_embeds": value_embeds,
+            "weights": weights,
+            "expert_matrix": expert_matrix,
+            "preds": preds,
+        }
+
+    def _forward_internals(
+        self,
+        retrieval_embeds: torch.Tensor,  # (B,H_retrieval)
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Dispatch to v1 or v2 pipeline depending on use_v2_loss.
+        """
+        self._ensure_prototypes_ready()
+        if self.use_v2_loss:
+            return self._forward_internals_v2(retrieval_embeds)
+        else:
+            return self._forward_internals_v1(retrieval_embeds)
 
     def forward(
         self,
@@ -266,7 +341,7 @@ class BasePrototypicalRegressor(pl.LightningModule):
         return preds
 
     # ------------------------------------------------------------
-    # Loss terms
+    # Loss terms (v1 + v2)
     # ------------------------------------------------------------
 
     def _task_loss(
@@ -294,6 +369,8 @@ class BasePrototypicalRegressor(pl.LightningModule):
         """
         Prototype self-fit:
           each prototype's expert should predict its own anchor's label.
+
+        Used in v1 loss; v2 folds this behavior into expert-fit + anchor routing.
         """
         if self.dm is None:
             return torch.tensor(0.0, device=self.device)
@@ -349,6 +426,10 @@ class BasePrototypicalRegressor(pl.LightningModule):
         weights: torch.Tensor,  # (B,P)
         labels: torch.Tensor,  # (B,)
     ) -> torch.Tensor:
+        """
+        Responsibility-weighted per-expert MSE.
+        Used in both v1 (as 'local loss') and v2 (as 'expert_fit').
+        """
         if expert_matrix.dim() == 3:
             expert_matrix = expert_matrix.squeeze(-1)
         B, P = expert_matrix.shape
@@ -363,6 +444,10 @@ class BasePrototypicalRegressor(pl.LightningModule):
         value_protos: torch.Tensor,  # (P,Dv)
         weights: torch.Tensor,  # (B,P)
     ) -> torch.Tensor:
+        """
+        v1: discourage assigning large weight to prototypes far away in value space.
+        In v2 we typically drop this (kernel handles geometry).
+        """
         B, Dv = value_embeds.shape
         P, Dp = value_protos.shape
         assert Dv == Dp, "consistency_loss: dim mismatch"
@@ -374,8 +459,74 @@ class BasePrototypicalRegressor(pl.LightningModule):
         weighted = weights * dist_sq  # (B,P)
         return weighted.mean()
 
+    # -------- v2-specific helper losses --------
+
+    def _anchor_routing_loss(
+        self,
+        weights: torch.Tensor,  # (B,P)
+        batch_indices: Optional[torch.Tensor],  # (B,) or None
+    ) -> torch.Tensor:
+        """
+        Encourage router to send each prototype's anchor example to that prototype.
+
+        For anchor example a(p) of prototype p, we want w[a(p), p] to be high.
+        Only anchors present in the current batch contribute.
+        """
+        if batch_indices is None:
+            return torch.tensor(0.0, device=weights.device)
+
+        pm = self.prototype_manager
+        if (
+            not hasattr(pm, "prototype_indices")
+            or pm.prototype_indices is None
+            or pm.prototype_indices.numel() == 0
+        ):
+            return torch.tensor(0.0, device=weights.device)
+
+        B, P = weights.shape
+        batch_indices = batch_indices.view(B).to(pm.prototype_indices.device)
+        proto_indices = pm.prototype_indices.view(1, P)  # (1,P)
+        batch_expanded = batch_indices.view(B, 1)  # (B,1)
+
+        # mask[b,p] = True iff example b is the anchor for prototype p
+        mask = batch_expanded.eq(proto_indices)  # (B,P)
+        if not mask.any():
+            return torch.tensor(0.0, device=weights.device)
+
+        anchor_weights = weights[mask]  # (num_anchors_in_batch,)
+        eps = 1e-8
+        return -torch.log(anchor_weights + eps).mean()
+
+    def _load_balance_loss(self, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Mixture-of-experts style load-balancing:
+        encourage all experts to receive similar average responsibility.
+        """
+        B, P = weights.shape
+        if B == 0 or P == 0:
+            return torch.tensor(0.0, device=weights.device)
+        usage = weights.mean(dim=0)  # (P,)
+        return P * (usage.pow(2).sum())
+
+    def _routing_entropy_loss(self, weights: torch.Tensor) -> torch.Tensor:
+        """
+        Optional routing-entropy term.
+
+        - With lambda_entropy > 0, minimizing this loss tends to REDUCE entropy
+          (sharper routing).
+        - With lambda_entropy < 0, minimizing this loss tends to INCREASE entropy
+          (smoother routing).
+        """
+        B, P = weights.shape
+        if B == 0 or P == 0:
+            return torch.tensor(0.0, device=weights.device)
+        eps = 1e-8
+        w = torch.clamp(weights, eps, 1.0)
+        entropy = -(w * w.log()).sum(dim=1).mean()  # average H over batch
+        return entropy
+
     # ------------------------------------------------------------
-    # Phase-aware weighting
+    # Phase-aware weighting (v1)
     # ------------------------------------------------------------
 
     def _phase_coeffs(self) -> Dict[str, float]:
@@ -416,14 +567,52 @@ class BasePrototypicalRegressor(pl.LightningModule):
         retrieval_embeds: torch.Tensor,  # (B,H)
         labels: torch.Tensor,  # (B,)
         internals: Dict[str, torch.Tensor],  # forward intermediates
+        batch_indices: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        c = self._phase_coeffs()
+        """
+        Compute scalar loss and its components.
 
+        If self.use_v2_loss is True, use PRLE v2 objectives:
+          - L_task_main
+          - L_expert_fit (local responsibility)
+          - L_anchor_route
+          - L_balance
+          - L_entropy (optional)
+
+        Otherwise, fall back to the original v1 multi-term loss.
+        """
         preds = internals["preds"]  # (B,)
         expert_matrix = internals["expert_matrix"]  # (B,P)/(B,P,1)
         weights = internals["weights"]  # (B,P)
         value_embeds = internals["value_embeds"]  # (B,Dv)
         value_protos = internals["value_protos"]  # (P,Dv)
+
+        if self.use_v2_loss:
+            l_task = self._task_loss(preds, labels)
+            l_fit = self._local_loss(expert_matrix, weights, labels)
+            l_anchor = self._anchor_routing_loss(weights, batch_indices)
+            l_balance = self._load_balance_loss(weights)
+            l_entropy = self._routing_entropy_loss(weights)
+
+            total = (
+                self.lambda_task_main * l_task
+                + self.lambda_expert_fit * l_fit
+                + self.lambda_anchor_route * l_anchor
+                + self.lambda_balance * l_balance
+                + self.lambda_entropy * l_entropy
+            )
+
+            return {
+                "total": total,
+                "task": l_task.detach(),
+                "expert_fit": l_fit.detach(),
+                "anchor_route": l_anchor.detach(),
+                "balance": l_balance.detach(),
+                "entropy": l_entropy.detach(),
+            }
+
+        # ---- original v1 behavior ----
+        c = self._phase_coeffs()
 
         l_task = self._task_loss(preds, labels)
         l_metric = self._metric_learning_loss(retrieval_embeds, labels)
@@ -447,14 +636,6 @@ class BasePrototypicalRegressor(pl.LightningModule):
             "local": l_local.detach(),
             "consistency": l_cons.detach(),
         }
-
-    # ------------------------------------------------------------
-    # Logging helpers
-    # ------------------------------------------------------------
-
-    # ------------------------------------------------------------
-    # Logging helpers
-    # ------------------------------------------------------------
 
     # ------------------------------------------------------------
     # Logging helpers
@@ -499,9 +680,6 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self.log(f"{prefix}_kendall", kendall_raw, prog_bar=False)
 
         # ---- NORMALIZED METRICS (OPTIONAL) ----
-        # If you want 0–1 metrics, set label_max somewhere:
-        #   - self.label_max in your model subclass, or
-        #   - dm.label_max in your DataModule
         label_max = None
         if hasattr(self, "label_max") and self.label_max is not None:
             label_max = float(self.label_max)
@@ -532,13 +710,82 @@ class BasePrototypicalRegressor(pl.LightningModule):
     # Lightning plumbing
     # ------------------------------------------------------------
 
+    def _init_prototypes_v2_value_space(self) -> None:
+        """
+        v2 prototype init:
+          - Compute ALL train embeddings in VALUE space via the kernel
+            projection head.
+          - Run the same clustering / seeding strategy as v1, but on
+            value-space embeddings (k-medoids, kmeans++, random_real, ...).
+          - Use the resulting indices to select retrieval-space prototypes,
+            so each prototype still corresponds to a concrete training example.
+        """
+        pm = self.prototype_manager
+
+        # Already initialized (from checkpoint or prior call)
+        if getattr(pm, "_is_initialized_buf", None) is not None:
+            if int(pm._is_initialized_buf.item()) == 1:
+                return
+        if getattr(pm, "_is_initialized", False):
+            return
+
+        if (
+            self.dm is None
+            or getattr(self.dm, "train_embeddings", None) is None
+        ):
+            raise RuntimeError(
+                "EmbeddingDataModule not attached or not setup; cannot init prototypes (v2)."
+            )
+
+        train_retr = self.dm.train_embeddings.detach().cpu()  # (N,H)
+        N = train_retr.size(0)
+        if N == 0:
+            raise RuntimeError(
+                "No train embeddings available for prototype init."
+            )
+
+        # Compute value-space embeddings for all train points in manageable chunks
+        device = self.device
+        pm_device = device  # keep projection head on model device
+        pm.to(pm_device)
+
+        chunks: List[torch.Tensor] = []
+        chunk_size = 4096
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk = train_retr[start:end].to(pm_device)
+            with torch.no_grad():
+                val_chunk = self.prototype_manager.project_embeddings(chunk)
+            chunks.append(val_chunk.detach().cpu())
+        train_val = torch.cat(chunks, dim=0)  # (N,Dv)
+
+        # Reuse the same seeding strategies but in VALUE space:
+        # we only need the indices, not the proto vectors they return.
+        proto_idx, _ = pm._init_raw_prototypes(train_val)  # type: ignore[attr-defined]
+
+        # Map back to retrieval space for actual stored prototype vectors
+        proto_idx = proto_idx.long().detach().cpu()
+        proto_vecs_retr = train_retr[proto_idx]  # (P,H)
+
+        pm._register_retrieval_prototypes(proto_vecs_retr)  # type: ignore[attr-defined]
+        pm.prototype_indices.data.copy_(proto_idx.long())
+        pm._is_initialized = True
+        if hasattr(pm, "_is_initialized_buf"):
+            pm._is_initialized_buf.data.copy_(
+                torch.tensor(1, dtype=torch.uint8)
+            )
+
     def _ensure_prototypes_ready(self) -> None:
         """
         Make sure prototypes are initialized exactly once.
 
-        We now rely on PrototypeManager._is_initialized_buf, which is saved
-        in checkpoints and starts at 0. After we populate real prototypes
-        from training embeddings, we flip it to 1.
+        v1:
+          - call PrototypeManager.initialize_from_train_embeddings(...)
+            using retrieval-space embeddings.
+
+        v2:
+          - run _init_prototypes_v2_value_space(), which picks anchors in
+            value space but stores retrieval-space vectors.
         """
         pm = self.prototype_manager
 
@@ -547,8 +794,11 @@ class BasePrototypicalRegressor(pl.LightningModule):
             if int(pm._is_initialized_buf.item()) == 1:
                 return
 
-        # Otherwise we are in a fresh run (no checkpoint init yet)
-        # and we need to initialize from train data.
+        if self.use_v2_loss:
+            self._init_prototypes_v2_value_space()
+            return
+
+        # v1: use existing retrieval-space initializer
         if (
             self.dm is None
             or getattr(self.dm, "train_embeddings", None) is None
@@ -563,9 +813,14 @@ class BasePrototypicalRegressor(pl.LightningModule):
     def _shared_step(self, batch: Dict[str, Any], stage: str) -> torch.Tensor:
         retrieval_embeds = batch["embeddings"].to(self.device).float()  # (B,H)
         labels = batch["labels"].to(self.device).float()  # (B,)
+        batch_indices = batch.get("indices", None)
+        if batch_indices is not None:
+            batch_indices = batch_indices.to(self.device)
 
         internals = self._forward_internals(retrieval_embeds)
-        losses = self._compute_total_loss(retrieval_embeds, labels, internals)
+        losses = self._compute_total_loss(
+            retrieval_embeds, labels, internals, batch_indices=batch_indices
+        )
         loss = losses["total"]
 
         if stage == "train":
@@ -614,22 +869,37 @@ class BasePrototypicalRegressor(pl.LightningModule):
         )
 
     # ------------------------------------------------------------
-    # EM-style alternation per epoch
+    # EM-style alternation per epoch (v1) + v2 override
     # ------------------------------------------------------------
 
     def on_train_epoch_start(self):
         """
-        If em_alt_training=True, flip between:
-          - geometry phase: train projection/prototypes, freeze experts+router
-          - experts phase:  freeze geometry, train experts+router
+        If use_v2_loss=True, we run in experts-only mode:
+          - geometry (projection + prototypes) frozen
+          - router + experts train
 
-        If em_alt_training=False:
-          everything is trainable ("all_unfrozen").
+        Else if em_alt_training=True (v1):
+          - alternate between geometry vs experts phases.
+
+        Else:
+          - all components train ("all_unfrozen").
         """
-        # NEW: gently anneal router temperature each epoch if it supports it
+        # router may implement epoch-wise annealing (e.g. temperature)
         if hasattr(self.activation_router, "epoch_anneal"):
             self.activation_router.epoch_anneal()
 
+        # ---- v2 override: always experts-only, geometry frozen ----
+        if self.use_v2_loss:
+            self._training_stage = "experts"
+            # geometry OFF
+            self.prototype_manager.enable_projection_training(False)
+            self.prototype_manager.enable_prototype_training(False)
+            # experts + router ON
+            self._enable_expert_training(True)
+            self._enable_router_training(True)
+            return
+
+        # ---- original v1 behavior ----
         if not self.em_alt_training:
             self._training_stage = "all_unfrozen"
             # everybody ON
@@ -664,7 +934,11 @@ class BasePrototypicalRegressor(pl.LightningModule):
     def on_train_epoch_end(self):
         """
         Optional snapping (keeps prototypes tied to real examples).
+        In v2 we typically keep prototypes fixed (no snapping), so we skip.
         """
+        if self.use_v2_loss:
+            return
+
         if (
             self.dm is not None
             and hasattr(self.dm, "train_embeddings")
@@ -689,7 +963,9 @@ class BasePrototypicalRegressor(pl.LightningModule):
         self._dump_trainable_status()
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        return torch.optim.Adam(
+            self.parameters(), lr=self.lr, weight_decay=5e-7
+        )
 
     def _dump_trainable_status(self):
         """

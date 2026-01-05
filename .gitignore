@@ -21,3 +21,12 @@ wmt_en_zh/
 wmt_si_en/
 
 relevant_notes/
+explore_and_debug/
+
+lightning_logs/
+prle_stsb_v2/
+prle_sickr_sts_v2/
+prle_sts22_v2/
+prle_wmt_en_zh_v2/
+
+PRLE.zip
